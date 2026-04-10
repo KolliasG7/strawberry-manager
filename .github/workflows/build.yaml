@@ -1,0 +1,180 @@
+name: "strawberry-manager"
+run-name: >-
+  ${{
+    github.event_name == 'workflow_dispatch' &&
+      (inputs.release_tag != '' && format('Release {0}', inputs.release_tag) || format('Build ({0})', github.ref_name))
+    || format('Release {0}', github.ref_name)
+  }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to publish (e.g. v0.2.1). Leave blank to build only.'
+        required: false
+        default: ''
+      prerelease:
+        description: 'Mark as pre-release'
+        required: false
+        default: false
+        type: boolean
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  # ─── Build ──────────────────────────────────────────────────────────────────
+  build:
+    name: "Build · x86_64"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            meson \
+            ninja-build \
+            libgtk-4-dev \
+            libglib2.0-dev
+
+      - name: Resolve version
+        id: version
+        run: |
+          TAG="${{ inputs.release_tag }}"
+          if [[ -z "$TAG" && "${{ github.ref_type }}" == "tag" ]]; then
+            TAG="${{ github.ref_name }}"
+          fi
+          if [[ -z "$TAG" ]]; then
+            TAG="$(grep -oP "(?<=version: ')[\d.]+" meson.build | head -1 || echo "dev")"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Resolved version: $TAG"
+
+      - name: meson setup
+        run: |
+          meson setup builddir \
+            --buildtype=release \
+            --prefix=/usr
+
+      - name: meson compile
+        run: meson compile -C builddir -j$(nproc)
+
+      - name: Package artifact
+        id: package
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          PKG="strawberry-manager-${TAG}-linux-x86_64"
+          STAGING="${PKG}"
+
+          mkdir -p "${STAGING}/bin" "${STAGING}/data" "${STAGING}/udev"
+
+          cp builddir/strawberry-kernel-manager "${STAGING}/bin/"
+          cp data/theme.css                     "${STAGING}/data/"
+          cp udev/99-strawberry-km.rules        "${STAGING}/udev/"
+
+          printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            'set -e' \
+            'PREFIX="${PREFIX:-/usr/local}"' \
+            'install -Dm755 bin/strawberry-kernel-manager "$PREFIX/bin/strawberry-kernel-manager"' \
+            'install -Dm644 data/theme.css "$PREFIX/share/strawberry-kernel-manager/theme.css"' \
+            'sudo install -Dm644 udev/99-strawberry-km.rules /etc/udev/rules.d/99-strawberry-km.rules' \
+            'sudo udevadm control --reload-rules' \
+            'sudo udevadm trigger' \
+            'echo "Done. Add yourself to the video group if needed:"' \
+            'echo "  sudo usermod -aG video $USER"' \
+            > "${STAGING}/install.sh"
+          chmod +x "${STAGING}/install.sh"
+
+          tar -czf "${PKG}.tar.gz" "${STAGING}"
+          echo "pkg=${PKG}.tar.gz" >> $GITHUB_OUTPUT
+          echo "pkg_name=${PKG}" >> $GITHUB_OUTPUT
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.pkg_name }}
+          path: ${{ steps.package.outputs.pkg }}
+          retention-days: 7
+
+  # ─── Release ────────────────────────────────────────────────────────────────
+  release:
+    name: "Publish Release"
+    needs: build
+    runs-on: ubuntu-latest
+    if: |
+      github.ref_type == 'tag' ||
+      (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.release_tag }}" ]]; then
+            echo "value=${{ inputs.release_tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "value=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: List dist contents
+        run: ls -lh dist/
+
+      - name: Generate release notes
+        run: |
+          VERSION="${{ steps.tag.outputs.value }}"
+          printf '%s\n' \
+            "## Strawberry Kernel Manager ${VERSION}" \
+            "" \
+            "Native GTK4 control panel for Strawberry PS4 Linux systems." \
+            "Covers fan threshold, front LED, GPU SCLK, HDMI reprobe, and live system status." \
+            "" \
+            "### Quick install" \
+            "" \
+            '```bash' \
+            "tar -xzf strawberry-manager-${VERSION}-linux-x86_64.tar.gz" \
+            "cd strawberry-manager-${VERSION}-linux-x86_64" \
+            "./install.sh" \
+            '```' \
+            "" \
+            "### Permissions" \
+            "" \
+            '```bash' \
+            "sudo cp udev/99-strawberry-km.rules /etc/udev/rules.d/" \
+            "sudo udevadm control --reload-rules && sudo udevadm trigger" \
+            'sudo usermod -aG video "$USER"' \
+            '```' \
+            > release_notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.value }}
+          name: "Strawberry Kernel Manager ${{ steps.tag.outputs.value }}"
+          body_path: release_notes.md
+          draft: false
+          prerelease: ${{ inputs.prerelease == 'true' || false }}
+          files: dist/*.tar.gz
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
