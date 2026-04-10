@@ -432,8 +432,10 @@ skm_on_led_apply_clicked(GtkButton *button, gpointer user_data)
   SkmAppWindow *self = user_data;
   SkmLedApplyData *params = g_new0(SkmLedApplyData, 1);
   guint selected = gtk_drop_down_get_selected(GTK_DROP_DOWN(self->led_effect_dropdown));
-  const gchar *effect = self->led_effect_model != NULL
-    ? gtk_string_list_get_string(self->led_effect_model, selected)
+  GListModel *list_model = gtk_drop_down_get_model(GTK_DROP_DOWN(self->led_effect_dropdown));
+  GtkStringList *string_list = GTK_IS_STRING_LIST(list_model) ? GTK_STRING_LIST(list_model) : NULL;
+  const gchar *effect = string_list != NULL
+    ? gtk_string_list_get_string(string_list, selected)
     : "off";
 
   (void) button;

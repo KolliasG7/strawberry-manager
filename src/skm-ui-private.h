@@ -34,8 +34,6 @@ struct _SkmAppWindow {
   gint gpu_selected_index;
   GDateTime *last_reprobe_at;
 
-  GtkStringList *led_effect_model;
-
   GtkWidget *notice_revealer;
   GtkWidget *notice_box;
   GtkWidget *notice_label;

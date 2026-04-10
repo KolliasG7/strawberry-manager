@@ -43,7 +43,6 @@ skm_app_window_free(gpointer data)
   }
 
   g_clear_object(&self->cancellable);
-  g_clear_object(&self->led_effect_model);
   g_clear_pointer(&self->last_reprobe_at, g_date_time_unref);
   skm_service_free(self->service);
   g_free(self);
@@ -159,8 +158,7 @@ skm_build_ui(SkmAppWindow *self)
   skm_attach_info_row(GTK_GRID(grid), 0, "Mode", &self->led_mode_value);
   skm_attach_info_row(GTK_GRID(grid), 1, "Active effect", &self->led_active_value);
   gtk_box_append(GTK_BOX(self->led_content), grid);
-  self->led_effect_model = gtk_string_list_new(NULL);
-  self->led_effect_dropdown = gtk_drop_down_new(G_LIST_MODEL(self->led_effect_model), NULL);
+  self->led_effect_dropdown = gtk_drop_down_new(G_LIST_MODEL(gtk_string_list_new(NULL)), NULL);
   g_signal_connect(self->led_effect_dropdown, "notify::selected", G_CALLBACK(skm_on_led_effect_changed), self);
   gtk_box_append(GTK_BOX(self->led_content), skm_make_control_row("Static effect", self->led_effect_dropdown, NULL));
   self->led_thermal_switch = gtk_switch_new();
