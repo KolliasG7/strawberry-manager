@@ -18,7 +18,7 @@ skm_update_led_control_sensitivity(SkmAppWindow *self)
 }
 
 static void
-skm_set_dropdown_strings(GtkDropDown *dropdown, GtkStringList **storage, GPtrArray *values)
+skm_set_dropdown_strings(GtkDropDown *dropdown, GPtrArray *values)
 {
   GtkStringList *model = NULL;
   guint i = 0;
@@ -31,7 +31,6 @@ skm_set_dropdown_strings(GtkDropDown *dropdown, GtkStringList **storage, GPtrArr
   }
 
   gtk_drop_down_set_model(dropdown, G_LIST_MODEL(model));
-  g_set_object(storage, model);
   g_object_unref(model);
 }
 
@@ -156,12 +155,14 @@ skm_update_led(SkmAppWindow *self, const SkmLedState *state)
     guint selected = 0;
 
     self->led_syncing = TRUE;
-    skm_set_dropdown_strings(GTK_DROP_DOWN(self->led_effect_dropdown), &self->led_effect_model, state->effect_options);
-    if (state->active_effect != NULL && self->led_effect_model != NULL) {
+    skm_set_dropdown_strings(GTK_DROP_DOWN(self->led_effect_dropdown), state->effect_options);
+    if (state->active_effect != NULL) {
+      GListModel *list_model = gtk_drop_down_get_model(GTK_DROP_DOWN(self->led_effect_dropdown));
+      GtkStringList *string_list = GTK_IS_STRING_LIST(list_model) ? GTK_STRING_LIST(list_model) : NULL;
       guint i = 0;
 
-      for (i = 0; i < g_list_model_get_n_items(G_LIST_MODEL(self->led_effect_model)); i++) {
-        const gchar *value = gtk_string_list_get_string(self->led_effect_model, i);
+      for (i = 0; string_list != NULL && i < g_list_model_get_n_items(G_LIST_MODEL(string_list)); i++) {
+        const gchar *value = gtk_string_list_get_string(string_list, i);
 
         if (g_strcmp0(value, state->active_effect) == 0) {
           selected = i;
