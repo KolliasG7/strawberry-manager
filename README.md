@@ -4,6 +4,12 @@ Strawberry Kernel Manager is a native C11 + GTK4 desktop application for Strawbe
 
 Current version: `0.2.0`
 
+## Screenshots
+
+![Strawberry Kernel Manager - Screenshot 1](https://github-production-user-asset-6210df.s3.amazonaws.com/65157164/576737452-e8a61c09-a85d-424b-9d9c-10e20b05ca45.jpg?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAVCODYLSA53PQK4ZA%2F20260410%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260410T180227Z&X-Amz-Expires=300&X-Amz-Signature=ae7fee23f7bde770f4c3375d2cc1254f99dee05d33f4004592f3e0f00b9bdfd5&X-Amz-SignedHeaders=host)
+
+![Strawberry Kernel Manager - Screenshot 2](https://github-production-user-asset-6210df.s3.amazonaws.com/65157164/576739597-a289655c-8491-48fd-9311-416b028e9fc9.jpg?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAVCODYLSA53PQK4ZA%2F20260410%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260410T180702Z&X-Amz-Expires=300&X-Amz-Signature=c96e93094d0bdeda6f447fcc06af5118352c9f6cb842981b0e5dd4d350425e74&X-Amz-SignedHeaders=host)
+
 ## Table of Contents
 
 - [Overview](#overview)
