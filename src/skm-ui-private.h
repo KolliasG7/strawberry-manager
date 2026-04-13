@@ -1,5 +1,7 @@
 #pragma once
 
+#include "skm-remote.h"
+#include "skm-settings.h"
 #include "skm-service.h"
 
 #include <gtk/gtk.h>
@@ -26,6 +28,7 @@ struct _SkmAppWindow {
   gboolean fan_syncing;
   gboolean led_syncing;
   gboolean gpu_syncing;
+  gboolean settings_syncing;
   gboolean fan_dirty;
   gboolean led_dirty;
   gboolean gpu_dirty;
@@ -33,14 +36,17 @@ struct _SkmAppWindow {
 
   gint gpu_selected_index;
   GDateTime *last_reprobe_at;
+  gchar *settings_path;
+  SkmRemoteServer *remote_server;
+  SkmAppSettings settings;
 
+  GtkWidget *root;
   GtkWidget *notice_revealer;
   GtkWidget *notice_box;
   GtkWidget *notice_label;
 
   GtkWidget *system_kernel_value;
   GtkWidget *system_variant_value;
-  GtkWidget *system_governor_value;
   GtkWidget *system_uptime_value;
 
   GtkWidget *fan_content;
@@ -84,6 +90,13 @@ struct _SkmAppWindow {
   GtkWidget *hdmi_status_value;
   GtkWidget *hdmi_last_reprobe_value;
   GtkWidget *hdmi_reprobe_button;
+
+  GtkWidget *settings_oled_switch;
+  GtkWidget *settings_poll_spin;
+  GtkWidget *settings_fan_debounce_spin;
+  GtkWidget *settings_remote_switch;
+  GtkWidget *settings_remote_port_spin;
+  GtkWidget *settings_remote_status_label;
 };
 
 GtkWidget *skm_make_label(const gchar *text, const gchar *css_class, gfloat xalign, gboolean wrap);
@@ -100,6 +113,12 @@ void skm_create_section_card(const gchar *title,
 
 void skm_flash_button(GtkWidget *button, gboolean success);
 void skm_show_notice(SkmAppWindow *self, const gchar *kind, const gchar *message);
+
+void skm_apply_theme(SkmAppWindow *self);
+void skm_sync_settings_controls(SkmAppWindow *self);
+void skm_restart_poll_timer(SkmAppWindow *self);
+void skm_persist_settings(SkmAppWindow *self);
+void skm_refresh_remote_server(SkmAppWindow *self, gboolean user_initiated);
 
 void skm_update_led_control_sensitivity(SkmAppWindow *self);
 void skm_update_system(SkmAppWindow *self, const SkmSystemInfoState *state);
@@ -125,3 +144,8 @@ void skm_on_gpu_apply_clicked(GtkButton *button, gpointer user_data);
 void skm_on_gpu_auto_clicked(GtkButton *button, gpointer user_data);
 void skm_on_gpu_reset_clicked(GtkButton *button, gpointer user_data);
 void skm_on_hdmi_reprobe_clicked(GtkButton *button, gpointer user_data);
+void skm_on_settings_oled_changed(GObject *object, GParamSpec *pspec, gpointer user_data);
+void skm_on_settings_poll_interval_changed(GtkSpinButton *spin, gpointer user_data);
+void skm_on_settings_fan_debounce_changed(GtkSpinButton *spin, gpointer user_data);
+void skm_on_settings_remote_changed(GObject *object, GParamSpec *pspec, gpointer user_data);
+void skm_on_settings_remote_port_changed(GtkSpinButton *spin, gpointer user_data);

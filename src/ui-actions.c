@@ -355,7 +355,7 @@ skm_on_fan_threshold_changed(GtkRange *range, gpointer user_data)
   if (self->fan_debounce_source_id != 0) {
     g_source_remove(self->fan_debounce_source_id);
   }
-  self->fan_debounce_source_id = g_timeout_add(500, skm_fan_debounce_cb, self);
+  self->fan_debounce_source_id = g_timeout_add(self->settings.fan_debounce_ms, skm_fan_debounce_cb, self);
 }
 
 void

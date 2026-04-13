@@ -1,4 +1,6 @@
 #include "skm-ui.h"
+#include "skm-remote.h"
+#include "skm-settings.h"
 
 #include <gtk/gtk.h>
 
@@ -52,7 +54,29 @@ int
 main(int argc, char **argv)
 {
   GtkApplication *application = NULL;
+  g_autoptr(GError) error = NULL;
+  g_autoptr(GOptionContext) options = NULL;
+  SkmAppSettings settings = { 0 };
+  gboolean headless = FALSE;
+  gint port_override = 0;
   int status = 0;
+  GOptionEntry entries[] = {
+    { "headless", 0, 0, G_OPTION_ARG_NONE, &headless, "Run phone control server without GTK window", NULL },
+    { "port", 0, 0, G_OPTION_ARG_INT, &port_override, "Override experimental phone control port", "PORT" },
+    { NULL },
+  };
+
+  options = g_option_context_new(NULL);
+  g_option_context_add_main_entries(options, entries, NULL);
+  if (!g_option_context_parse(options, &argc, &argv, &error)) {
+    g_printerr("Option parse failed: %s\n", error->message);
+    return 1;
+  }
+
+  skm_settings_load(&settings, NULL, NULL);
+  if (headless) {
+    return skm_remote_run_headless(&settings, port_override);
+  }
 
   application = gtk_application_new(
     "io.strawberry.kernelmanager",

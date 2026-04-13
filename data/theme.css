@@ -138,6 +138,14 @@ label {
   color: @text_hi;
 }
 
+.view-switcher {
+  padding: 0 0 8px;
+}
+
+.view-switcher button {
+  min-width: 128px;
+}
+
 .notice-success {
   box-shadow: 0 0 18px @strawberry_glow;
 }
@@ -201,6 +209,10 @@ scale slider {
 }
 
 switch slider {
+  min-width: 20px;
+  min-height: 20px;
+  margin: 2px;
+  border-radius: 50%;
   background-color: @text_dim;
 }
 
@@ -220,6 +232,48 @@ switch {
   border: 1px solid rgba(255, 77, 120, 0.10);
   border-radius: 8px;
   padding: 10px;
+}
+
+.settings-status {
+  background-color: rgba(255, 77, 120, 0.04);
+  border: 1px solid rgba(255, 77, 120, 0.10);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+.remote-status-error {
+  background-color: rgba(180, 32, 48, 0.18);
+  border-color: rgba(255, 120, 120, 0.48);
+  color: @text_hi;
+}
+
+.oled-black,
+.oled-black scrolledwindow,
+.oled-black scrolledwindow > viewport {
+  background-color: #000000;
+}
+
+.oled-black .glass-card {
+  background-image: none;
+  background-color: rgba(0, 0, 0, 0.96);
+  border-color: rgba(255, 77, 120, 0.14);
+  box-shadow: none;
+}
+
+.oled-black .aurora-header {
+  background-image:
+    radial-gradient(circle at 10% 10%, rgba(255, 77, 120, 0.10), transparent 38%),
+    radial-gradient(circle at 84% 16%, rgba(200, 40, 100, 0.08), transparent 32%);
+}
+
+.oled-black .metric-card,
+.oled-black .level-list,
+.oled-black .settings-status {
+  background-color: rgba(8, 8, 10, 0.96);
+}
+
+.oled-black .notice-banner {
+  background-color: #030304;
 }
 
 .glow-dot {

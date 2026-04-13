@@ -22,11 +22,14 @@ sources = files(
   'src/ui-common.c',
   'src/ui-update.c',
   'src/ui-actions.c',
+  'src/ui-settings.c',
   'src/service.c',
   'src/service-system.c',
   'src/service-fan.c',
   'src/service-led.c',
   'src/service-gpu.c',
+  'src/settings.c',
+  'src/remote.c',
   'src/sysfs.c',
 )
 

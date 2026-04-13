@@ -42,8 +42,14 @@ The application is also deliberately defensive:
 
 - Displays kernel release from `uname`
 - Detects PS4 GPU variant when known
-- Shows current CPU governor
 - Shows human-readable uptime
+
+### Settings
+
+- Adds dedicated Dashboard / Settings tab layout
+- Supports OLED black mode for lower-glow panels
+- Lets you tune dashboard refresh interval in `ms`
+- Lets you tune fan auto-apply debounce in `ms`
 
 ### Fan Control
 
@@ -52,7 +58,7 @@ The application is also deliberately defensive:
 - Writes fan threshold through `temp1_crit`
 - Enforces threshold range `20` to `85` degrees C
 - Uses `79` degrees C as reset/default value
-- Debounces slider writes by `500 ms`
+- Debounces slider writes with user-configurable timing
 
 ### Front LED Control
 
@@ -78,10 +84,18 @@ The application is also deliberately defensive:
 - Triggers reprobe by writing `detect` to connector status
 - Tracks last reprobe timestamp in the UI
 
+### Remote Control — Braska
+
+The experimental HTTP control page has been removed. Remote control is handled by [Braska](https://github.com/rmuxnet/Braska), a Flutter mobile app that connects to the Strawberry Kernel Manager API over LAN.
+
+- Headless mode exposes the same REST API, WebSocket telemetry, and PTY terminal that Braska uses
+- No browser UI is served; `GET /` returns a JSON health blob
+- Auth is opt-in via `remote_password` in `settings.ini`
+
 ### UX and Reliability
 
 - Worker-thread sysfs I/O keeps UI responsive
-- Automatic polling every `2` seconds
+- Automatic polling uses user-configurable interval
 - Section-level availability handling
 - Clear success and failure notifications for operations
 
@@ -143,6 +157,14 @@ meson setup builddir
 meson compile -C builddir
 ./builddir/strawberry-kernel-manager
 ```
+
+### Headless Remote Mode
+
+```bash
+./builddir/strawberry-kernel-manager --headless --port 8080
+```
+
+Exposes the Braska REST API, WebSocket telemetry, and PTY terminal on the specified port. Connect with the [Braska](https://github.com/rmuxnet/Braska) app. No browser UI is served.
 
 ### Optional Install
 
@@ -266,11 +288,14 @@ If you launch binary from custom location, make sure stylesheet is reachable thr
 - `src/ui-common.c` - shared GTK widget helpers and notices
 - `src/ui-update.c` - snapshot-to-widget update logic
 - `src/ui-actions.c` - async task dispatch and signal handlers
+- `src/ui-settings.c` - settings persistence hooks and runtime toggles
 - `src/service.c` - shared service lifetime and snapshot orchestration
 - `src/service-system.c` - system summary and HDMI service logic
 - `src/service-fan.c` - fan read and write operations
 - `src/service-led.c` - LED discovery, defaults, and apply logic
 - `src/service-gpu.c` - GPU detection, SCLK parsing, and force logic
+- `src/settings.c` - local settings load and save helpers
+- `src/remote.c` - Braska API server: REST endpoints, WebSocket telemetry, PTY terminal
 - `src/sysfs.c` - low-level sysfs and procfs helpers
 - `include/skm-service.h` - public service data model and API
 - `include/skm-sysfs.h` - low-level sysfs helper API
@@ -284,8 +309,8 @@ If you launch binary from custom location, make sure stylesheet is reachable thr
 - UI toolkit: GTK4
 - Utility/runtime libraries: GLib and GIO
 - Build system: Meson + Ninja
-- Poll interval: `2` seconds
-- Fan threshold debounce: `500 ms`
+- Poll interval: configurable, defaults to `2` seconds
+- Fan threshold debounce: configurable, defaults to `500 ms`
 - GPU/HDMI confirmation waits: `500 ms`
 
 Project is structured so UI and hardware service logic stay separate. Public interfaces remain in `include/`, while internal module boundaries are split into smaller source files under `src/`.

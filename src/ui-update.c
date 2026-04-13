@@ -100,7 +100,6 @@ skm_update_system(SkmAppWindow *self, const SkmSystemInfoState *state)
 {
   gtk_label_set_text(GTK_LABEL(self->system_kernel_value), state->kernel_version);
   gtk_label_set_text(GTK_LABEL(self->system_variant_value), state->hardware_variant);
-  gtk_label_set_text(GTK_LABEL(self->system_governor_value), state->cpu_governor);
   gtk_label_set_text(GTK_LABEL(self->system_uptime_value), state->uptime);
 }
 
