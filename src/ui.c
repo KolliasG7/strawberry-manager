@@ -71,7 +71,7 @@ skm_build_dashboard_page(SkmAppWindow *self, GtkWidget *content)
   gtk_widget_add_css_class(card, "hero-card");
   hero = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 16);
   gtk_widget_add_css_class(hero, "aurora-header");
-  gtk_box_append(GTK_BOX(hero), skm_make_label("🍓", "hero-logo", 0.0f, FALSE));
+  gtk_box_append(GTK_BOX(hero), skm_make_logo_widget());
   title_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
   gtk_widget_set_hexpand(title_box, TRUE);
   gtk_box_append(GTK_BOX(title_box), skm_make_label("Strawberry Kernel Manager", "hero-title", 0.0f, FALSE));
@@ -137,8 +137,8 @@ skm_build_dashboard_page(SkmAppWindow *self, GtkWidget *content)
   self->led_effect_dropdown = gtk_drop_down_new(G_LIST_MODEL(gtk_string_list_new(NULL)), NULL);
   g_signal_connect(self->led_effect_dropdown, "notify::selected", G_CALLBACK(skm_on_led_effect_changed), self);
   gtk_box_append(GTK_BOX(self->led_content), skm_make_control_row("Static effect", self->led_effect_dropdown, NULL));
-  self->led_thermal_switch = gtk_switch_new();
-  g_signal_connect(self->led_thermal_switch, "notify::active", G_CALLBACK(skm_on_led_thermal_changed), self);
+  self->led_thermal_switch = skm_make_toggle_pill("Static", "Thermal");
+  g_signal_connect(self->led_thermal_switch, "toggled", G_CALLBACK(skm_on_led_thermal_changed), self);
   self->led_thermal_row = skm_make_control_row("Thermal mode", self->led_thermal_switch, NULL);
   gtk_widget_set_visible(self->led_thermal_row, FALSE);
   gtk_box_append(GTK_BOX(self->led_content), self->led_thermal_row);
@@ -178,8 +178,8 @@ skm_build_dashboard_page(SkmAppWindow *self, GtkWidget *content)
   skm_attach_info_row(GTK_GRID(grid), 1, "Perf level", &self->gpu_mode_value);
   skm_attach_info_row(GTK_GRID(grid), 2, "Active SCLK", &self->gpu_active_value);
   gtk_box_append(GTK_BOX(self->gpu_content), grid);
-  self->gpu_manual_switch = gtk_switch_new();
-  g_signal_connect(self->gpu_manual_switch, "notify::active", G_CALLBACK(skm_on_gpu_manual_changed), self);
+  self->gpu_manual_switch = skm_make_toggle_pill("Auto", "Manual");
+  g_signal_connect(self->gpu_manual_switch, "toggled", G_CALLBACK(skm_on_gpu_manual_changed), self);
   gtk_box_append(GTK_BOX(self->gpu_content), skm_make_control_row("Force Manual", self->gpu_manual_switch, NULL));
   self->gpu_levels_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
   gtk_widget_add_css_class(self->gpu_levels_box, "level-list");
@@ -242,12 +242,12 @@ skm_build_settings_page(SkmAppWindow *self, GtkWidget *content)
   gtk_widget_add_css_class(card, "hero-card");
   header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 16);
   gtk_widget_add_css_class(header, "aurora-header");
-  gtk_box_append(GTK_BOX(header), skm_make_label("⚙", "hero-logo", 0.0f, FALSE));
+  gtk_box_append(GTK_BOX(header), skm_make_logo_widget());
   title_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
   gtk_widget_set_hexpand(title_box, TRUE);
   gtk_box_append(GTK_BOX(title_box), skm_make_label("Settings", "hero-title", 0.0f, FALSE));
   gtk_box_append(GTK_BOX(title_box), skm_make_label(
-    "Local UI preferences, timing tweaks, and experimental phone access.",
+    "Local UI preferences, timing tweaks, and Strawberry Manager remote access.",
     "hero-subtitle",
     0.0f,
     TRUE));
@@ -266,8 +266,8 @@ skm_build_settings_page(SkmAppWindow *self, GtkWidget *content)
     TRUE));
   gtk_box_append(GTK_BOX(card), header);
   body = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
-  self->settings_oled_switch = gtk_switch_new();
-  g_signal_connect(self->settings_oled_switch, "notify::active", G_CALLBACK(skm_on_settings_oled_changed), self);
+  self->settings_oled_switch = skm_make_toggle_pill("Glow", "Black");
+  g_signal_connect(self->settings_oled_switch, "toggled", G_CALLBACK(skm_on_settings_oled_changed), self);
   gtk_box_append(GTK_BOX(body), skm_make_control_row("OLED black", self->settings_oled_switch, NULL));
   gtk_box_append(GTK_BOX(body), skm_make_label(
     "Turns surfaces closer to pure black and softens glow for OLED panels.",
@@ -317,16 +317,16 @@ skm_build_settings_page(SkmAppWindow *self, GtkWidget *content)
   card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
   gtk_widget_add_css_class(card, "glass-card");
   header = gtk_box_new(GTK_ORIENTATION_VERTICAL, 3);
-  gtk_box_append(GTK_BOX(header), skm_make_label("Experimental", "card-title", 0.0f, FALSE));
+  gtk_box_append(GTK_BOX(header), skm_make_label("Remote Access", "card-title", 0.0f, FALSE));
   gtk_box_append(GTK_BOX(header), skm_make_label(
-    "Optional phone browser control over LAN. Also available with `--headless` startup.",
+    "Optional LAN API for Strawberry Manager. Also available with `--headless` startup.",
     "card-subtitle",
     0.0f,
     TRUE));
   gtk_box_append(GTK_BOX(card), header);
   body = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
-  self->settings_remote_switch = gtk_switch_new();
-  g_signal_connect(self->settings_remote_switch, "notify::active", G_CALLBACK(skm_on_settings_remote_changed), self);
+  self->settings_remote_switch = skm_make_toggle_pill("Off", "LAN");
+  g_signal_connect(self->settings_remote_switch, "toggled", G_CALLBACK(skm_on_settings_remote_changed), self);
   gtk_box_append(GTK_BOX(body), skm_make_control_row("Remote API", self->settings_remote_switch, NULL));
   self->settings_remote_port_spin = gtk_spin_button_new_with_range(
     SKM_REMOTE_PORT_MIN,
@@ -341,7 +341,7 @@ skm_build_settings_page(SkmAppWindow *self, GtkWidget *content)
   self->settings_remote_status_label = skm_make_label("", "settings-status", 0.0f, TRUE);
   gtk_box_append(GTK_BOX(body), self->settings_remote_status_label);
   gtk_box_append(GTK_BOX(body), skm_make_label(
-    "No auth built in yet. Use trusted LAN only. Works for windowed app and `--headless` mode.",
+    "Set `remote_password` in settings.ini if you want auth. Use trusted LAN only.",
     "warning-banner",
     0.0f,
     TRUE));

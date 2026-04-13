@@ -398,12 +398,10 @@ skm_on_led_effect_changed(GObject *object, GParamSpec *pspec, gpointer user_data
 }
 
 void
-skm_on_led_thermal_changed(GObject *object, GParamSpec *pspec, gpointer user_data)
+skm_on_led_thermal_changed(GtkToggleButton *button, gpointer user_data)
 {
   SkmAppWindow *self = user_data;
-
-  (void) object;
-  (void) pspec;
+  (void) button;
 
   skm_update_led_control_sensitivity(self);
 
@@ -442,7 +440,7 @@ skm_on_led_apply_clicked(GtkButton *button, gpointer user_data)
 
   params->button = self->led_apply_button;
   params->effect = g_strdup(effect != NULL ? effect : "off");
-  params->thermal_mode = gtk_switch_get_active(GTK_SWITCH(self->led_thermal_switch));
+  params->thermal_mode = skm_toggle_pill_get_active(self->led_thermal_switch);
   params->thermal_interval_ms = gtk_widget_get_visible(self->led_interval_row)
     ? gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(self->led_interval_spin))
     : 2000;
@@ -488,13 +486,10 @@ skm_on_led_reset_clicked(GtkButton *button, gpointer user_data)
 }
 
 void
-skm_on_gpu_manual_changed(GObject *object, GParamSpec *pspec, gpointer user_data)
+skm_on_gpu_manual_changed(GtkToggleButton *button, gpointer user_data)
 {
   SkmAppWindow *self = user_data;
   SkmGpuManualData *params = NULL;
-
-  (void) object;
-  (void) pspec;
 
   if (self->gpu_syncing) {
     return;
@@ -502,7 +497,7 @@ skm_on_gpu_manual_changed(GObject *object, GParamSpec *pspec, gpointer user_data
 
   params = g_new0(SkmGpuManualData, 1);
   params->button = self->gpu_apply_button;
-  params->enabled = gtk_switch_get_active(GTK_SWITCH(self->gpu_manual_switch));
+  params->enabled = gtk_toggle_button_get_active(button);
   skm_run_task(self, skm_worker_set_gpu_manual, skm_finish_set_gpu_manual, params, g_free);
 }
 

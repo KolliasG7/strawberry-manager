@@ -101,9 +101,13 @@ struct _SkmAppWindow {
 
 GtkWidget *skm_make_label(const gchar *text, const gchar *css_class, gfloat xalign, gboolean wrap);
 GtkWidget *skm_make_button(const gchar *text, const gchar *css_class);
+GtkWidget *skm_make_logo_widget(void);
 GtkWidget *skm_attach_info_row(GtkGrid *grid, gint row, const gchar *title, GtkWidget **out_value);
 GtkWidget *skm_make_metric_tile(const gchar *title, GtkWidget **out_value);
 GtkWidget *skm_make_control_row(const gchar *title, GtkWidget *widget, GtkWidget *value_widget);
+GtkWidget *skm_make_toggle_pill(const gchar *off_text, const gchar *on_text);
+gboolean skm_toggle_pill_get_active(GtkWidget *widget);
+void skm_toggle_pill_set_active(GtkWidget *widget, gboolean active);
 void skm_create_section_card(const gchar *title,
                              const gchar *subtitle,
                              GtkWidget **out_card,
@@ -134,18 +138,18 @@ void skm_on_fan_threshold_changed(GtkRange *range, gpointer user_data);
 void skm_on_fan_apply_clicked(GtkButton *button, gpointer user_data);
 void skm_on_fan_reset_clicked(GtkButton *button, gpointer user_data);
 void skm_on_led_effect_changed(GObject *object, GParamSpec *pspec, gpointer user_data);
-void skm_on_led_thermal_changed(GObject *object, GParamSpec *pspec, gpointer user_data);
+void skm_on_led_thermal_changed(GtkToggleButton *button, gpointer user_data);
 void skm_on_led_interval_changed(GtkSpinButton *spin, gpointer user_data);
 void skm_on_led_apply_clicked(GtkButton *button, gpointer user_data);
 void skm_on_led_reset_clicked(GtkButton *button, gpointer user_data);
 void skm_on_gpu_level_toggled(GtkCheckButton *check, gpointer user_data);
-void skm_on_gpu_manual_changed(GObject *object, GParamSpec *pspec, gpointer user_data);
+void skm_on_gpu_manual_changed(GtkToggleButton *button, gpointer user_data);
 void skm_on_gpu_apply_clicked(GtkButton *button, gpointer user_data);
 void skm_on_gpu_auto_clicked(GtkButton *button, gpointer user_data);
 void skm_on_gpu_reset_clicked(GtkButton *button, gpointer user_data);
 void skm_on_hdmi_reprobe_clicked(GtkButton *button, gpointer user_data);
-void skm_on_settings_oled_changed(GObject *object, GParamSpec *pspec, gpointer user_data);
+void skm_on_settings_oled_changed(GtkToggleButton *button, gpointer user_data);
 void skm_on_settings_poll_interval_changed(GtkSpinButton *spin, gpointer user_data);
 void skm_on_settings_fan_debounce_changed(GtkSpinButton *spin, gpointer user_data);
-void skm_on_settings_remote_changed(GObject *object, GParamSpec *pspec, gpointer user_data);
+void skm_on_settings_remote_changed(GtkToggleButton *button, gpointer user_data);
 void skm_on_settings_remote_port_changed(GtkSpinButton *spin, gpointer user_data);

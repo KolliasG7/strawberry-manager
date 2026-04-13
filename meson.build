@@ -43,5 +43,6 @@ executable(
 
 install_data(
   'data/theme.css',
+  'data/strawberry-logo.svg',
   install_dir: join_paths(get_option('datadir'), meson.project_name()),
 )

@@ -38,16 +38,16 @@ void
 skm_sync_settings_controls(SkmAppWindow *self)
 {
   self->settings_syncing = TRUE;
-  gtk_switch_set_active(GTK_SWITCH(self->settings_oled_switch), self->settings.oled_black_mode);
+  skm_toggle_pill_set_active(self->settings_oled_switch, self->settings.oled_black_mode);
   gtk_spin_button_set_value(GTK_SPIN_BUTTON(self->settings_poll_spin), self->settings.poll_interval_ms);
   gtk_spin_button_set_value(GTK_SPIN_BUTTON(self->settings_fan_debounce_spin), self->settings.fan_debounce_ms);
-  gtk_switch_set_active(GTK_SWITCH(self->settings_remote_switch), self->settings.remote_enabled);
+  skm_toggle_pill_set_active(self->settings_remote_switch, self->settings.remote_enabled);
   gtk_spin_button_set_value(GTK_SPIN_BUTTON(self->settings_remote_port_spin), self->settings.remote_port);
   self->settings_syncing = FALSE;
 
   if (!self->settings.remote_enabled) {
     g_autofree gchar *message = g_strdup_printf(
-      "Phone control off. Enable to listen on port %d.",
+      "Strawberry Manager API off. Enable to listen on port %d.",
       self->settings.remote_port);
     skm_update_remote_status(self, FALSE, message);
   }
@@ -92,10 +92,10 @@ skm_refresh_remote_server(SkmAppWindow *self, gboolean user_initiated)
 
   if (!self->settings.remote_enabled) {
     skm_remote_server_stop(self->remote_server);
-    message = g_strdup_printf("Phone control off. Enable to listen on port %d.", self->settings.remote_port);
+    message = g_strdup_printf("Strawberry Manager API off. Enable to listen on port %d.", self->settings.remote_port);
     skm_update_remote_status(self, FALSE, message);
     if (user_initiated) {
-      skm_show_notice(self, "notice-success", "Experimental phone control disabled.");
+      skm_show_notice(self, "notice-success", "Strawberry Manager remote API disabled.");
     }
     return;
   }
@@ -106,7 +106,7 @@ skm_refresh_remote_server(SkmAppWindow *self, gboolean user_initiated)
   if (skm_remote_server_is_running(self->remote_server) &&
       skm_remote_server_get_port(self->remote_server) == self->settings.remote_port) {
     message = g_strdup_printf(
-      "Listening on port %d for phone control. Trusted LAN only.",
+      "Listening on port %d for Strawberry Manager. Trusted LAN only.",
       self->settings.remote_port);
     skm_update_remote_status(self, FALSE, message);
     return;
@@ -125,7 +125,7 @@ skm_refresh_remote_server(SkmAppWindow *self, gboolean user_initiated)
   }
 
   message = g_strdup_printf(
-    "Listening on port %d for phone control. Open console IP in phone browser.",
+    "Listening on port %d for Strawberry Manager remote access.",
     self->settings.remote_port);
   skm_update_remote_status(self, FALSE, message);
   if (user_initiated) {
@@ -134,18 +134,15 @@ skm_refresh_remote_server(SkmAppWindow *self, gboolean user_initiated)
 }
 
 void
-skm_on_settings_oled_changed(GObject *object, GParamSpec *pspec, gpointer user_data)
+skm_on_settings_oled_changed(GtkToggleButton *button, gpointer user_data)
 {
   SkmAppWindow *self = user_data;
-
-  (void) object;
-  (void) pspec;
 
   if (self->settings_syncing) {
     return;
   }
 
-  self->settings.oled_black_mode = gtk_switch_get_active(GTK_SWITCH(self->settings_oled_switch));
+  self->settings.oled_black_mode = gtk_toggle_button_get_active(button);
   skm_apply_theme(self);
   skm_persist_settings(self);
 }
@@ -179,18 +176,15 @@ skm_on_settings_fan_debounce_changed(GtkSpinButton *spin, gpointer user_data)
 }
 
 void
-skm_on_settings_remote_changed(GObject *object, GParamSpec *pspec, gpointer user_data)
+skm_on_settings_remote_changed(GtkToggleButton *button, gpointer user_data)
 {
   SkmAppWindow *self = user_data;
-
-  (void) object;
-  (void) pspec;
 
   if (self->settings_syncing) {
     return;
   }
 
-  self->settings.remote_enabled = gtk_switch_get_active(GTK_SWITCH(self->settings_remote_switch));
+  self->settings.remote_enabled = gtk_toggle_button_get_active(button);
   skm_refresh_remote_server(self, TRUE);
   skm_persist_settings(self);
 }

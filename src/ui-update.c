@@ -11,7 +11,7 @@ skm_set_section_availability(GtkWidget *content, GtkWidget *unavailable, gboolea
 void
 skm_update_led_control_sensitivity(SkmAppWindow *self)
 {
-  gboolean thermal_mode = gtk_switch_get_active(GTK_SWITCH(self->led_thermal_switch));
+  gboolean thermal_mode = skm_toggle_pill_get_active(self->led_thermal_switch);
 
   gtk_widget_set_sensitive(self->led_effect_dropdown, !thermal_mode);
   gtk_widget_set_sensitive(self->led_interval_spin, thermal_mode);
@@ -173,7 +173,7 @@ skm_update_led(SkmAppWindow *self, const SkmLedState *state)
 
     gtk_widget_set_visible(self->led_thermal_row, state->thermal_mode_supported);
     if (state->has_thermal_mode) {
-      gtk_switch_set_active(GTK_SWITCH(self->led_thermal_switch), state->thermal_mode);
+      skm_toggle_pill_set_active(self->led_thermal_switch, state->thermal_mode);
     }
     gtk_widget_set_visible(self->led_interval_row, state->has_thermal_interval_ms);
     if (state->has_thermal_interval_ms) {
@@ -229,8 +229,8 @@ skm_update_gpu(SkmAppWindow *self, const SkmGpuState *state)
   }
 
   self->gpu_syncing = TRUE;
-  gtk_switch_set_active(
-    GTK_SWITCH(self->gpu_manual_switch),
+  skm_toggle_pill_set_active(
+    self->gpu_manual_switch,
     g_strcmp0(state->performance_level, "manual") == 0);
   self->gpu_syncing = FALSE;
 

@@ -71,6 +71,11 @@ label {
   font-size: 42px;
 }
 
+.hero-logo-image {
+  min-width: 56px;
+  min-height: 56px;
+}
+
 .hero-title {
   color: @text_hi;
   font-size: 26px;
@@ -199,32 +204,47 @@ scale highlight {
   background-color: @strawberry;
 }
 
-scale slider {
-  min-width: 16px;
-  min-height: 16px;
-  border-radius: 6px;
-  border: 1px solid @strawberry_bright;
+button.toggle-pill {
+  min-width: 98px;
+  min-height: 38px;
+  padding: 0 14px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 112, 150, 0.22);
+  background-image: linear-gradient(180deg, rgba(30, 6, 15, 0.98), rgba(18, 4, 10, 0.98));
+  background-color: rgba(18, 4, 10, 0.98);
+  color: @text_hi;
+  box-shadow: inset 0 1px 0 rgba(255, 214, 227, 0.08);
+}
+
+button.toggle-pill label {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.10em;
+}
+
+button.toggle-pill:hover {
+  border-color: rgba(255, 112, 150, 0.34);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 214, 227, 0.12),
+    0 0 14px rgba(255, 77, 120, 0.12);
+}
+
+button.toggle-pill:checked,
+button.toggle-pill.toggle-pill-on {
+  border-color: rgba(255, 140, 174, 0.72);
+  background-image: linear-gradient(180deg, #ff8aa8, #ff4d78);
   background-color: @strawberry;
-  box-shadow: 0 0 12px @strawberry_glow;
+  color: @bg;
+  box-shadow: 0 0 18px @strawberry_glow;
 }
 
-switch slider {
-  min-width: 20px;
-  min-height: 20px;
-  margin: 2px;
-  border-radius: 50%;
-  background-color: @text_dim;
+button.toggle-pill:checked label,
+button.toggle-pill.toggle-pill-on label {
+  color: @bg;
 }
 
-switch:checked slider {
-  background-color: @strawberry;
-  box-shadow: 0 0 10px @strawberry_glow;
-}
-
-dropdown,
-checkbutton,
-switch {
-  color: @text_main;
+button.toggle-pill:disabled {
+  opacity: 0.58;
 }
 
 .level-list {
@@ -285,9 +305,4 @@ switch {
 
 scrollbar {
   background-color: @bg;
-}
-
-scrollbar slider {
-  background-color: #5a1530;
-  border-radius: 6px;
 }

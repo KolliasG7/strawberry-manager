@@ -31,6 +31,31 @@ skm_make_button(const gchar *text, const gchar *css_class)
 }
 
 GtkWidget *
+skm_make_logo_widget(void)
+{
+  const gchar *candidates[] = {
+    "data/strawberry-logo.svg",
+    "./data/strawberry-logo.svg",
+    "../data/strawberry-logo.svg",
+    NULL,
+  };
+  guint i = 0;
+
+  for (i = 0; candidates[i] != NULL; i++) {
+    if (g_file_test(candidates[i], G_FILE_TEST_EXISTS)) {
+      GtkWidget *picture = gtk_picture_new_for_filename(candidates[i]);
+
+      gtk_picture_set_content_fit(GTK_PICTURE(picture), GTK_CONTENT_FIT_CONTAIN);
+      gtk_widget_set_size_request(picture, 56, 56);
+      gtk_widget_add_css_class(picture, "hero-logo-image");
+      return picture;
+    }
+  }
+
+  return skm_make_label("🍓", "hero-logo", 0.0f, FALSE);
+}
+
+GtkWidget *
 skm_attach_info_row(GtkGrid *grid, gint row, const gchar *title, GtkWidget **out_value)
 {
   GtkWidget *key = skm_make_label(title, "dim-label", 0.0f, FALSE);
@@ -66,10 +91,12 @@ skm_make_control_row(const gchar *title, GtkWidget *widget, GtkWidget *value_wid
 {
   GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
   GtkWidget *title_label = skm_make_label(title, "dim-label", 0.0f, FALSE);
+  gboolean widget_expands = GTK_IS_RANGE(widget) || GTK_IS_SPIN_BUTTON(widget) || GTK_IS_DROP_DOWN(widget);
 
   gtk_widget_set_hexpand(row, TRUE);
   gtk_widget_set_size_request(title_label, 150, -1);
-  gtk_widget_set_hexpand(widget, TRUE);
+  gtk_widget_set_hexpand(widget, widget_expands);
+  gtk_widget_set_halign(widget, widget_expands ? GTK_ALIGN_FILL : GTK_ALIGN_END);
 
   gtk_box_append(GTK_BOX(row), title_label);
   gtk_box_append(GTK_BOX(row), widget);
@@ -78,6 +105,48 @@ skm_make_control_row(const gchar *title, GtkWidget *widget, GtkWidget *value_wid
   }
 
   return row;
+}
+
+static void
+skm_toggle_pill_refresh(GtkToggleButton *button, gpointer user_data)
+{
+  const gchar *off_text = g_object_get_data(G_OBJECT(button), "skm-pill-off");
+  const gchar *on_text = g_object_get_data(G_OBJECT(button), "skm-pill-on");
+  gboolean active = gtk_toggle_button_get_active(button);
+
+  (void) user_data;
+
+  gtk_button_set_label(GTK_BUTTON(button), active ? on_text : off_text);
+  if (active) {
+    gtk_widget_add_css_class(GTK_WIDGET(button), "toggle-pill-on");
+  } else {
+    gtk_widget_remove_css_class(GTK_WIDGET(button), "toggle-pill-on");
+  }
+}
+
+GtkWidget *
+skm_make_toggle_pill(const gchar *off_text, const gchar *on_text)
+{
+  GtkWidget *button = gtk_toggle_button_new_with_label(off_text);
+
+  gtk_widget_add_css_class(button, "toggle-pill");
+  g_object_set_data_full(G_OBJECT(button), "skm-pill-off", g_strdup(off_text), g_free);
+  g_object_set_data_full(G_OBJECT(button), "skm-pill-on", g_strdup(on_text), g_free);
+  g_signal_connect(button, "toggled", G_CALLBACK(skm_toggle_pill_refresh), NULL);
+  skm_toggle_pill_refresh(GTK_TOGGLE_BUTTON(button), NULL);
+  return button;
+}
+
+gboolean
+skm_toggle_pill_get_active(GtkWidget *widget)
+{
+  return gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(widget));
+}
+
+void
+skm_toggle_pill_set_active(GtkWidget *widget, gboolean active)
+{
+  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(widget), active);
 }
 
 void

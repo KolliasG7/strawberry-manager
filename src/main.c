@@ -61,8 +61,8 @@ main(int argc, char **argv)
   gint port_override = 0;
   int status = 0;
   GOptionEntry entries[] = {
-    { "headless", 0, 0, G_OPTION_ARG_NONE, &headless, "Run phone control server without GTK window", NULL },
-    { "port", 0, 0, G_OPTION_ARG_INT, &port_override, "Override experimental phone control port", "PORT" },
+    { "headless", 0, 0, G_OPTION_ARG_NONE, &headless, "Run Strawberry Manager remote API without GTK window", NULL },
+    { "port", 0, 0, G_OPTION_ARG_INT, &port_override, "Override Strawberry Manager remote API port", "PORT" },
     { NULL },
   };
 

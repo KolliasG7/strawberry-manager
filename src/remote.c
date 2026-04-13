@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <sys/ioctl.h>
 #include <sys/reboot.h>
+#include <sys/sysinfo.h>
 #include <sys/statvfs.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -263,16 +264,101 @@ skm_read_meminfo(gdouble *total_mb, gdouble *used_mb, gdouble *available_mb,
 /* ── Process list from /proc ────────────────────────────────────────────── */
 
 typedef struct {
-  gint   pid;
-  gchar  comm[64];
-  gchar  state;
-  gulong utime;
-  gulong stime;
-  gulong rss_kb;
+  gint    pid;
+  gint    threads;
+  gchar   comm[64];
+  gchar   user[64];
+  gchar   status[24];
+  gchar   cmdline[256];
+  gchar   state;
+  gulong  utime;
+  gulong  stime;
+  gulong  rss_kb;
+  gdouble mem_percent;
   gdouble cpu_percent;
 } SkmProcEntry;
 
-/* Simple compare for qsort: sort by cpu_percent desc */
+static const gchar *
+skm_proc_state_name(gchar state)
+{
+  switch (state) {
+    case 'R': return "running";
+    case 'S': return "sleeping";
+    case 'D': return "disk_sleep";
+    case 'T': return "stopped";
+    case 't': return "tracing_stop";
+    case 'Z': return "zombie";
+    case 'X': return "dead";
+    case 'I': return "idle";
+    default:  return "unknown";
+  }
+}
+
+static void
+skm_proc_lookup_user(uid_t uid, gchar *buffer, gsize buffer_size)
+{
+  struct passwd pwd = { 0 };
+  struct passwd *result = NULL;
+  gchar scratch[1024];
+
+  if (getpwuid_r(uid, &pwd, scratch, sizeof(scratch), &result) == 0 &&
+      result != NULL &&
+      result->pw_name != NULL) {
+    g_snprintf(buffer, buffer_size, "%s", result->pw_name);
+    return;
+  }
+
+  g_snprintf(buffer, buffer_size, "%u", (guint) uid);
+}
+
+static void
+skm_proc_read_details(SkmProcEntry *entry)
+{
+  gchar proc_dir[64];
+  gchar status_path[64];
+  gchar cmdline_path[64];
+  GStatBuf st;
+
+  g_snprintf(proc_dir, sizeof(proc_dir), "/proc/%d", entry->pid);
+  if (g_stat(proc_dir, &st) == 0) {
+    skm_proc_lookup_user(st.st_uid, entry->user, sizeof(entry->user));
+  }
+
+  g_snprintf(status_path, sizeof(status_path), "/proc/%d/status", entry->pid);
+  FILE *status_file = fopen(status_path, "r");
+  if (status_file != NULL) {
+    gchar line[256];
+
+    while (fgets(line, sizeof(line), status_file) != NULL) {
+      if (sscanf(line, "Threads: %d", &entry->threads) == 1) {
+        continue;
+      }
+    }
+    fclose(status_file);
+  }
+
+  g_snprintf(cmdline_path, sizeof(cmdline_path), "/proc/%d/cmdline", entry->pid);
+  FILE *cmdline_file = fopen(cmdline_path, "r");
+  if (cmdline_file != NULL) {
+    gsize bytes = fread(entry->cmdline, 1, sizeof(entry->cmdline) - 1, cmdline_file);
+
+    fclose(cmdline_file);
+    if (bytes > 0) {
+      for (gsize i = 0; i < bytes; i++) {
+        if (entry->cmdline[i] == '\0') {
+          entry->cmdline[i] = ' ';
+        }
+      }
+      entry->cmdline[bytes] = '\0';
+      g_strstrip(entry->cmdline);
+    }
+  }
+
+  if (entry->cmdline[0] == '\0') {
+    g_snprintf(entry->cmdline, sizeof(entry->cmdline), "%s", entry->comm);
+  }
+}
+
 static int
 skm_proc_cmp_cpu(const void *a, const void *b)
 {
@@ -282,16 +368,46 @@ skm_proc_cmp_cpu(const void *a, const void *b)
   return 0;
 }
 
+static int
+skm_proc_cmp_mem(const void *a, const void *b)
+{
+  const SkmProcEntry *pa = a, *pb = b;
+  if (pa->rss_kb > pb->rss_kb) return -1;
+  if (pa->rss_kb < pb->rss_kb) return  1;
+  return 0;
+}
+
+static int
+skm_proc_cmp_pid(const void *a, const void *b)
+{
+  const SkmProcEntry *pa = a, *pb = b;
+  if (pa->pid < pb->pid) return -1;
+  if (pa->pid > pb->pid) return  1;
+  return 0;
+}
+
+static int
+skm_proc_cmp_name(const void *a, const void *b)
+{
+  const SkmProcEntry *pa = a, *pb = b;
+  return g_ascii_strcasecmp(pa->comm, pb->comm);
+}
+
 static GArray *
-skm_read_processes(gint limit)
+skm_read_processes(gint limit, const gchar *sort_by)
 {
   GArray *arr = g_array_new(FALSE, TRUE, sizeof(SkmProcEntry));
   DIR *proc = opendir("/proc");
   struct dirent *ent;
+  gdouble total_ram_kb = 0.0;
+  struct sysinfo sys_info = { 0 };
 
   if (proc == NULL) return arr;
+  if (sysinfo(&sys_info) == 0 && sys_info.totalram > 0) {
+    total_ram_kb = ((gdouble) sys_info.totalram * (gdouble) sys_info.mem_unit) / 1024.0;
+  }
 
-  while ((ent = readdir(proc)) != NULL && (gint) arr->len < MIN(limit, SKM_REMOTE_PROCESS_LIMIT_MAX)) {
+  while ((ent = readdir(proc)) != NULL) {
     if (ent->d_type != DT_DIR && ent->d_type != DT_UNKNOWN) continue;
     if (!g_ascii_isdigit(ent->d_name[0])) continue;
 
@@ -315,12 +431,15 @@ skm_read_processes(gint limit)
                raw_comm, &state_c, &utime, &stime, &rss) >= 4) {
       g_snprintf(e.comm, sizeof(e.comm), "%s", raw_comm);
       e.state = state_c;
+      g_snprintf(e.status, sizeof(e.status), "%s", skm_proc_state_name(state_c));
       e.utime = utime;
       e.stime = stime;
       /* rss is in pages */
       e.rss_kb = (gulong)rss * (gulong)(sysconf(_SC_PAGESIZE) / 1024);
+      e.mem_percent = total_ram_kb > 0.0 ? MIN(((gdouble) e.rss_kb / total_ram_kb) * 100.0, 100.0) : 0.0;
       /* naive cpu_percent: (utime+stime) / uptime ticks — approximate */
       e.cpu_percent = 0.0; /* filled below */
+      skm_proc_read_details(&e);
       g_array_append_val(arr, e);
     }
     fclose(sf);
@@ -342,7 +461,19 @@ skm_read_processes(gint limit)
     }
   }
 
-  qsort(arr->data, arr->len, sizeof(SkmProcEntry), skm_proc_cmp_cpu);
+  if (g_strcmp0(sort_by, "mem") == 0) {
+    qsort(arr->data, arr->len, sizeof(SkmProcEntry), skm_proc_cmp_mem);
+  } else if (g_strcmp0(sort_by, "pid") == 0) {
+    qsort(arr->data, arr->len, sizeof(SkmProcEntry), skm_proc_cmp_pid);
+  } else if (g_strcmp0(sort_by, "name") == 0) {
+    qsort(arr->data, arr->len, sizeof(SkmProcEntry), skm_proc_cmp_name);
+  } else {
+    qsort(arr->data, arr->len, sizeof(SkmProcEntry), skm_proc_cmp_cpu);
+  }
+
+  if (arr->len > (guint) MIN(limit, SKM_REMOTE_PROCESS_LIMIT_MAX)) {
+    g_array_set_size(arr, MIN(limit, SKM_REMOTE_PROCESS_LIMIT_MAX));
+  }
   return arr;
 }
 
@@ -859,7 +990,7 @@ skm_remote_shorten_agent(const gchar *user_agent)
   }
 
   if (g_strrstr(user_agent, "Braska") != NULL) {
-    return g_strdup("Braska");
+    return g_strdup("Strawberry Manager");
   }
   if (g_strrstr(user_agent, "Android") != NULL) {
     return g_strdup("Android");
@@ -1131,20 +1262,58 @@ skm_build_tunnel_status_json(void)
 }
 
 static gchar *
-skm_build_processes_json(gint limit)
+skm_build_processes_json(gint limit, const gchar *sort_by)
 {
-  GArray *arr = skm_read_processes(limit > 0 ? limit : SKM_REMOTE_PROCESS_LIMIT_DEFAULT);
+  GArray *arr = skm_read_processes(limit > 0 ? limit : SKM_REMOTE_PROCESS_LIMIT_DEFAULT, sort_by);
   GString *json = g_string_new("{\"processes\":[");
 
   for (guint i = 0; i < arr->len; i++) {
     SkmProcEntry *p = &g_array_index(arr, SkmProcEntry, i);
     g_autofree gchar *escaped_comm = skm_json_escape(p->comm);
+    g_autofree gchar *escaped_user = skm_json_escape(p->user);
+    g_autofree gchar *escaped_status = skm_json_escape(p->status);
+    g_autofree gchar *escaped_cmdline = skm_json_escape(p->cmdline);
+    gdouble memory_mb = (gdouble) p->rss_kb / 1024.0;
     if (i > 0) g_string_append_c(json, ',');
     g_string_append_printf(json,
-      "{\"pid\":%d,\"name\":\"%s\",\"state\":\"%c\","
-      "\"cpu_percent\":%.1f,\"memory_mb\":%.1f}",
-      p->pid, escaped_comm, p->state,
-      p->cpu_percent, (gdouble) p->rss_kb / 1024.0);
+      "{\"pid\":%d,"
+      "\"name\":\"%s\","
+      "\"command\":\"%s\","
+      "\"user\":\"%s\","
+      "\"username\":\"%s\","
+      "\"state\":\"%c\","
+      "\"status\":\"%s\","
+      "\"threads\":%d,"
+      "\"cmdline\":\"%s\","
+      "\"cpu\":%.1f,"
+      "\"cpu_pct\":%.1f,"
+      "\"cpuPercent\":%.1f,"
+      "\"cpu_percent\":%.1f,"
+      "\"memory\":%.1f,"
+      "\"mem_rss_mb\":%.1f,"
+      "\"memoryMb\":%.1f,"
+      "\"memory_mb\":%.1f,"
+      "\"mem_pct\":%.1f,"
+      "\"memory_percent\":%.1f}",
+      p->pid,
+      escaped_comm,
+      escaped_comm,
+      escaped_user,
+      escaped_user,
+      p->state,
+      escaped_status,
+      p->threads,
+      escaped_cmdline,
+      p->cpu_percent,
+      p->cpu_percent,
+      p->cpu_percent,
+      p->cpu_percent,
+      memory_mb,
+      memory_mb,
+      memory_mb,
+      memory_mb,
+      p->mem_percent,
+      p->mem_percent);
   }
   g_string_append_printf(json, "],\"count\":%u}", arr->len);
   g_array_free(arr, TRUE);
@@ -1701,7 +1870,7 @@ skm_handle_api_request(SkmRemoteServer *server,
   /* ── /auth/login ────────────────────────────────────────────────────── */
   if (g_strcmp0(path, "/auth/login") == 0 && g_strcmp0(method, "POST") == 0) {
     if (!server->auth_required) {
-      /* No password configured — return stable token for Braska reconnects. */
+      /* No password configured — return stable token for reconnects. */
       return g_strdup_printf("{\"token\":\"%s\",\"auth_required\":false}",
                              SKM_REMOTE_OPEN_TOKEN);
     }
@@ -1807,9 +1976,10 @@ skm_handle_api_request(SkmRemoteServer *server,
   /* ── Processes ───────────────────────────────────────────────────────── */
   } else if (g_strcmp0(path, "/api/system/processes") == 0 && g_strcmp0(method, "GET") == 0) {
     const gchar *limit_str = g_hash_table_lookup(query, "limit");
+    const gchar *sort_by = g_hash_table_lookup(query, "sort_by");
     gint limit = limit_str ? CLAMP(atoi(limit_str), 1, SKM_REMOTE_PROCESS_LIMIT_MAX)
                            : SKM_REMOTE_PROCESS_LIMIT_DEFAULT;
-    response = skm_build_processes_json(limit);
+    response = skm_build_processes_json(limit, sort_by);
 
   } else if (g_strcmp0(path, "/api/system/process/kill") == 0 && g_strcmp0(method, "POST") == 0) {
     const gchar *pid_str = g_hash_table_lookup(values, "pid");
@@ -2009,7 +2179,7 @@ skm_remote_server_run(GThreadedSocketService *service,
   skm_remote_record_client(server, peer, method, path, g_hash_table_lookup(headers, "user-agent"));
 
   if (skm_is_websocket_request(headers)) {
-    /* For WS, Braska passes ?token=<hex> in query string.
+    /* For WS, mobile app passes ?token=<hex> in query string.
      * Inject it as a synthetic "token" header so the auth guard finds it. */
     const gchar *qs_token = g_hash_table_lookup(query, "token");
     if (qs_token != NULL)
@@ -2234,7 +2404,7 @@ skm_remote_run_headless(const SkmAppSettings *settings, gint port_override)
   }
 
   g_print("Strawberry Kernel Manager remote listening on http://0.0.0.0:%d\n", port);
-  g_print("Braska API + telemetry WS + PTY terminal: same host/port\n");
+  g_print("Strawberry Manager API + telemetry WS + PTY terminal: same host/port\n");
   if (server->auth_required)
     g_print("Auth: password required (HMAC-SHA256 token).\n");
   else

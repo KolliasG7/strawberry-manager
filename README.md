@@ -84,11 +84,11 @@ The application is also deliberately defensive:
 - Triggers reprobe by writing `detect` to connector status
 - Tracks last reprobe timestamp in the UI
 
-### Remote Control — Braska
+### Remote Control — Strawberry Manager
 
-The experimental HTTP control page has been removed. Remote control is handled by [Braska](https://github.com/rmuxnet/Braska), a Flutter mobile app that connects to the Strawberry Kernel Manager API over LAN.
+The experimental HTTP control page has been removed. Remote control is handled by Strawberry Manager, the Flutter mobile app in the [`braska/`](./braska) tree, which connects to the Strawberry Kernel Manager API over LAN.
 
-- Headless mode exposes the same REST API, WebSocket telemetry, and PTY terminal that Braska uses
+- Headless mode exposes the same REST API, WebSocket telemetry, and PTY terminal that Strawberry Manager uses
 - No browser UI is served; `GET /` returns a JSON health blob
 - Auth is opt-in via `remote_password` in `settings.ini`
 
@@ -164,7 +164,7 @@ meson compile -C builddir
 ./builddir/strawberry-kernel-manager --headless --port 8080
 ```
 
-Exposes the Braska REST API, WebSocket telemetry, and PTY terminal on the specified port. Connect with the [Braska](https://github.com/rmuxnet/Braska) app. No browser UI is served.
+Exposes the Strawberry Manager REST API, WebSocket telemetry, and PTY terminal on the specified port. Connect with the mobile app in [`braska/`](./braska). No browser UI is served.
 
 ### Optional Install
 
@@ -295,7 +295,7 @@ If you launch binary from custom location, make sure stylesheet is reachable thr
 - `src/service-led.c` - LED discovery, defaults, and apply logic
 - `src/service-gpu.c` - GPU detection, SCLK parsing, and force logic
 - `src/settings.c` - local settings load and save helpers
-- `src/remote.c` - Braska API server: REST endpoints, WebSocket telemetry, PTY terminal
+- `src/remote.c` - Strawberry Manager API server: REST endpoints, WebSocket telemetry, PTY terminal
 - `src/sysfs.c` - low-level sysfs and procfs helpers
 - `include/skm-service.h` - public service data model and API
 - `include/skm-sysfs.h` - low-level sysfs helper API
