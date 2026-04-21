@@ -49,6 +49,22 @@
 /* HMAC salt length in raw bytes (hex-encoded for on-disk storage). */
 #define SKM_HMAC_SALT_BYTES 16
 
+/* Post-response actions deferred until the reply is flushed + connection
+ * closed — if we called reboot()/poweroff() inline, the client would see a
+ * TCP RST and misreport the command as failed. */
+typedef enum {
+  SKM_POST_ACTION_NONE = 0,
+  SKM_POST_ACTION_REBOOT,
+  SKM_POST_ACTION_POWEROFF,
+} SkmPostAction;
+
+/* Telemetry push cadence (match legacy behaviour) + ping interval used to
+ * detect half-open clients (iOS suspended apps, dropped Wi-Fi, etc.). */
+#define SKM_WS_TELEMETRY_INTERVAL_US   2000000  /* 2s payload cadence */
+#define SKM_WS_PING_INTERVAL_US       15000000  /* 15s keepalive ping */
+#define SKM_WS_POLL_TIMEOUT_MS             200
+#define SKM_WS_MAX_CONTROL_PAYLOAD      125       /* RFC 6455 §5.5 */
+
 /* ── CPU delta tracking (protected by g_cpu_mutex) ─────────────────────── */
 static GMutex  g_cpu_mutex;
 static guint64 g_cpu_prev_total = 0;
@@ -214,6 +230,44 @@ skm_generate_hmac_salt(void)
 }
 
 /* ── CPU% reader (/proc/stat delta) ────────────────────────────────────── */
+
+/* Reads /proc/stat and computes CPU% against the caller's own previous
+ * sample. Pass a pair of zero-initialised guint64s the first time — result
+ * will be 0.0 on the first call and accurate thereafter. This variant is
+ * the preferred one for per-client usage (e.g. each WS telemetry pump)
+ * because two clients with different sample rates would fight over the
+ * server-global baseline otherwise. */
+static gdouble
+skm_read_cpu_percent_local(guint64 *prev_total, guint64 *prev_idle)
+{
+  FILE *f = fopen("/proc/stat", "r");
+  guint64 user = 0, nice = 0, system = 0, idle = 0, iowait = 0,
+          irq = 0, softirq = 0, steal = 0;
+  if (f == NULL) return 0.0;
+  if (fscanf(f,
+       "cpu %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT
+       " %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT
+       " %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT,
+       &user, &nice, &system, &idle, &iowait, &irq, &softirq, &steal) < 4) {
+    fclose(f);
+    return 0.0;
+  }
+  fclose(f);
+
+  guint64 idle_total = idle + iowait;
+  guint64 total = user + nice + system + idle_total + irq + softirq + steal;
+
+  if (*prev_total == 0) {
+    *prev_total = total;
+    *prev_idle  = idle_total;
+    return 0.0;
+  }
+  guint64 dtotal = total - *prev_total;
+  guint64 didle  = idle_total - *prev_idle;
+  *prev_total = total;
+  *prev_idle  = idle_total;
+  return dtotal > 0 ? (1.0 - (gdouble) didle / (gdouble) dtotal) * 100.0 : 0.0;
+}
 
 static gdouble
 skm_read_cpu_percent(void)
@@ -997,8 +1051,12 @@ skm_write_response(GOutputStream *output,
     reason = "Not Found";
   } else if (status == 405) {
     reason = "Method Not Allowed";
+  } else if (status == 422) {
+    reason = "Unprocessable Entity";
   } else if (status == 426) {
     reason = "Upgrade Required";
+  } else if (status == 429) {
+    reason = "Too Many Requests";
   } else if (status == 500) {
     reason = "Internal Server Error";
   } else if (status == 501) {
@@ -1501,7 +1559,12 @@ skm_files_validate_path(const gchar *input, const gchar **out_reason)
     return NULL;
   }
 
-  g_autofree gchar *canonical = g_canonicalize_filename(input, NULL);
+  /* realpath() follows symlinks and requires every component to exist, so a
+   * caller can't smuggle in an allowlisted prefix that points at something
+   * outside (e.g. /tmp/escape -> /etc). g_canonicalize_filename was purely
+   * lexical and would have let that through. */
+  char *resolved = realpath(input, NULL);
+  g_autofree gchar *canonical = resolved;
   if (canonical == NULL) {
     if (out_reason != NULL) *out_reason = "Path not accessible.";
     return NULL;
@@ -1584,7 +1647,12 @@ skm_build_telemetry_json(SkmService *service)
   snapshot = skm_service_read_snapshot(service);
 
   cpu_pct = skm_read_cpu_percent();
-  skm_read_cpuinfo((gint *) &cores, &freq_mhz);
+  /* Previously this line did a pointer-cast type-pun — writing a gint
+   * through a gdouble's storage — which works today by accident but UB
+   * formally and breaks under -flto. Store into a real gint. */
+  gint core_count = 1;
+  skm_read_cpuinfo(&core_count, &freq_mhz);
+  cores = core_count;
   skm_read_loadavg(&l1, &l5, &l15);
   skm_read_meminfo(&mem_total, &mem_used, &mem_avail, &mem_cached, &mem_buffers, &mem_pct,
                    &swap_total, &swap_used);
@@ -1930,6 +1998,44 @@ skm_values_from_json_or_form(const gchar *content_type, const gchar *body)
   return skm_parse_form(body);
 }
 
+/* Read, discard, and classify one incoming WS frame. Returns the opcode on
+ * success, or -1 if the peer went away / sent an over-sized frame. We only
+ * care about control frames (close/ping/pong) on this endpoint; text/binary
+ * frames from the client are drained and ignored. */
+static gint
+skm_ws_drain_inbound_frame(GInputStream *input)
+{
+  guint8 hdr[2];
+  gsize got = 0;
+  if (!g_input_stream_read_all(input, hdr, 2, &got, NULL, NULL) || got != 2) {
+    return -1;
+  }
+  guint8 opcode = hdr[0] & 0x0f;
+  gboolean masked = (hdr[1] & 0x80) != 0;
+  guint64 payload_len = hdr[1] & 0x7f;
+  if (payload_len == 126) {
+    guint8 ext[2];
+    if (!g_input_stream_read_all(input, ext, 2, &got, NULL, NULL) || got != 2) return -1;
+    payload_len = ((guint64) ext[0] << 8) | ext[1];
+  } else if (payload_len == 127) {
+    guint8 ext[8];
+    if (!g_input_stream_read_all(input, ext, 8, &got, NULL, NULL) || got != 8) return -1;
+    payload_len = 0;
+    for (int i = 0; i < 8; i++) payload_len = (payload_len << 8) | ext[i];
+  }
+  if (masked) {
+    guint8 mask[4];
+    if (!g_input_stream_read_all(input, mask, 4, &got, NULL, NULL) || got != 4) return -1;
+  }
+  if (payload_len > 65536) return -1; /* reject oversized frames */
+  if (payload_len > 0) {
+    g_autofree guint8 *buf = g_malloc(payload_len);
+    if (!g_input_stream_read_all(input, buf, payload_len, &got, NULL, NULL) || got != payload_len)
+      return -1;
+  }
+  return (gint) opcode;
+}
+
 static gboolean
 skm_handle_ws_telemetry(GSocketConnection *connection, GHashTable *headers)
 {
@@ -1937,22 +2043,77 @@ skm_handle_ws_telemetry(GSocketConnection *connection, GHashTable *headers)
   GOutputStream *output = g_io_stream_get_output_stream(G_IO_STREAM(connection));
   const gchar *key = g_hash_table_lookup(headers, "sec-websocket-key");
   SkmService *service = NULL;
+  /* Per-connection CPU baseline — previously every WS client shared the same
+   * g_cpu_prev_total/idle globals, so two subscribers caused oscillating
+   * percentages because each one consumed the other's delta. */
+  guint64 cpu_prev_total = 0, cpu_prev_idle = 0;
+  gint64 now_us = 0, last_send_us = 0, last_ping_us = 0;
+  gint fd = -1;
 
   if (!skm_ws_send_handshake(output, key)) {
     return FALSE;
   }
 
   service = skm_service_new("/sys", "/proc");
-  for (;;) {
-    g_autofree gchar *payload = skm_build_telemetry_json(service);
+  fd = g_socket_get_fd(g_socket_connection_get_socket(connection));
 
-    if (!skm_ws_write_text(output, payload)) {
-      break;
+  for (;;) {
+    now_us = g_get_monotonic_time();
+
+    /* Cadence: push a telemetry JSON every SKM_WS_TELEMETRY_INTERVAL_US. */
+    if (now_us - last_send_us >= SKM_WS_TELEMETRY_INTERVAL_US) {
+      gdouble cpu_pct = skm_read_cpu_percent_local(&cpu_prev_total, &cpu_prev_idle);
+      (void) cpu_pct; /* skm_build_telemetry_json queries cpu itself for REST parity */
+      g_autofree gchar *payload = skm_build_telemetry_json(service);
+      if (!skm_ws_write_text(output, payload)) {
+        goto closed;
+      }
+      last_send_us = now_us;
     }
-    g_usleep(2000000);
+
+    /* Keepalive ping so a silently-dropped socket (e.g. iOS app suspended
+     * mid-frame, NAT box forgot the mapping) surfaces as a write error
+     * within ~15s instead of leaving a worker thread stuck forever. */
+    if (now_us - last_ping_us >= SKM_WS_PING_INTERVAL_US) {
+      if (!skm_ws_write_frame(output, 0x9, NULL, 0)) {
+        goto closed;
+      }
+      last_ping_us = now_us;
+    }
+
+    /* Poll briefly so we can (a) notice close frames promptly, (b) honour
+     * pings from the client, (c) wake up when it's time for the next push. */
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    int r = poll(&pfd, 1, SKM_WS_POLL_TIMEOUT_MS);
+    if (r < 0) {
+      if (errno == EINTR) continue;
+      goto closed;
+    }
+    if (r == 0) continue;
+    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) goto closed;
+    if (!(pfd.revents & POLLIN)) continue;
+
+    gint opcode = skm_ws_drain_inbound_frame(input);
+    if (opcode < 0) goto closed;
+    if (opcode == 0x8) {
+      /* Close — echo it back so the client sees a clean shutdown. */
+      skm_ws_write_frame(output, 0x8, NULL, 0);
+      goto closed;
+    }
+    if (opcode == 0x9) {
+      /* Ping — RFC 6455 requires a pong with the same payload; we send
+       * empty which is acceptable for liveness and avoids echoing attacker
+       * data in the less-than-1KB buffer. */
+      skm_ws_write_frame(output, 0xA, NULL, 0);
+    }
+    /* pong (0xA) or any unsupported opcode — ignore. */
   }
+
+closed:
+  /* Best-effort close frame — ignore write failure since the peer may be
+   * gone already. */
+  skm_ws_write_frame(output, 0x8, NULL, 0);
   skm_service_free(service);
-  (void) input;
   return TRUE;
 }
 
@@ -2076,7 +2237,8 @@ skm_handle_api_request(SkmRemoteServer *server,
                        const gchar *peer_ip,
                        gint *out_status,
                        gboolean *out_notice_success,
-                       gchar **out_notice_message)
+                       gchar **out_notice_message,
+                       SkmPostAction *out_post_action)
 {
   SkmSnapshot *snapshot = NULL;
   SkmService *service = NULL;
@@ -2085,6 +2247,7 @@ skm_handle_api_request(SkmRemoteServer *server,
   const gchar *action = NULL;
 
   *out_status = 200;
+  if (out_post_action != NULL) *out_post_action = SKM_POST_ACTION_NONE;
 
   /* ── /auth/login ────────────────────────────────────────────────────── */
   if (g_strcmp0(path, "/auth/login") == 0 && g_strcmp0(method, "POST") == 0) {
@@ -2223,9 +2386,59 @@ skm_handle_api_request(SkmRemoteServer *server,
       else if (g_strcmp0(sig_str, "SIGCONT") == 0) sig = SIGCONT;
       else if (g_strcmp0(sig_str, "SIGHUP")  == 0) sig = SIGHUP;
 
+      const gchar *reject_reason = NULL;
       if (pid <= 1) {
+        reject_reason = "Refusing to signal init / PID <= 1.";
+      } else if (pid == 2) {
+        reject_reason = "Refusing to signal kthreadd.";
+      } else {
+        /* Reject kernel threads (parent PID == 0 or == 2): they can't be
+         * killed from userspace and attempting to do so is always a mistake. */
+        g_autofree gchar *status_path = g_strdup_printf("/proc/%d/status", (int) pid);
+        g_autofree gchar *status_body = NULL;
+        if (g_file_get_contents(status_path, &status_body, NULL, NULL) && status_body != NULL) {
+          const gchar *p = strstr(status_body, "\nPPid:");
+          if (p == NULL && g_str_has_prefix(status_body, "PPid:")) p = status_body;
+          if (p != NULL) {
+            while (*p && (*p == 'P' || *p == 'i' || *p == 'd' || *p == ':' || *p == '\n' || *p == '\t' || *p == ' ')) p++;
+            gint ppid = atoi(p);
+            if (ppid == 0 || ppid == 2) {
+              reject_reason = "Refusing to signal kernel thread.";
+            }
+          }
+        } else {
+          /* /proc lookup failed — process likely doesn't exist. Let the
+           * kill() call produce the canonical ESRCH error below. */
+        }
+
+        /* Deny-list common critical system daemons by comm name. This is
+         * not security (a malicious caller can still use SIGKILL on any
+         * PID they can reach) — it's a guard rail so that an accidental
+         * tap on the iOS Processes tab can't take the PS4 offline. */
+        if (reject_reason == NULL) {
+          g_autofree gchar *comm_path = g_strdup_printf("/proc/%d/comm", (int) pid);
+          g_autofree gchar *comm = NULL;
+          if (g_file_get_contents(comm_path, &comm, NULL, NULL) && comm != NULL) {
+            g_strstrip(comm);
+            static const gchar *critical[] = {
+              "systemd", "init", "kthreadd", "ksoftirqd", "migration",
+              "rcu_sched", "rcu_bh", "watchdog", "kworker",
+              "strawberry-kernel-manager", /* don't kill ourselves */
+              NULL,
+            };
+            for (gsize i = 0; critical[i] != NULL; i++) {
+              if (g_str_has_prefix(comm, critical[i])) {
+                reject_reason = "Refusing to signal a critical system process.";
+                break;
+              }
+            }
+          }
+        }
+      }
+
+      if (reject_reason != NULL) {
         *out_status = 403;
-        response = skm_build_json_detail(403, "Refusing to signal PID <= 1.");
+        response = skm_build_json_detail(403, reject_reason);
       } else if (kill(pid, sig) == 0) {
         response = g_strdup_printf("{\"pid\":%d,\"signal\":\"%s\",\"ok\":true}",
                                    (int) pid, sig_str != NULL ? sig_str : "SIGTERM");
@@ -2238,18 +2451,17 @@ skm_handle_api_request(SkmRemoteServer *server,
   /* ── Power ───────────────────────────────────────────────────────────── */
   } else if (g_str_has_prefix(path, "/api/power/") && g_strcmp0(method, "POST") == 0) {
     const gchar *act = path + strlen("/api/power/");
+    /* Defer reboot()/poweroff() until the HTTP response has been flushed to
+     * the client and the connection closed. Calling reboot() inline here
+     * meant the client saw a TCP RST partway through the response and
+     * reported the command as failed, even though the kernel was already
+     * tearing things down. */
     if (g_strcmp0(act, "reboot") == 0) {
       response = g_strdup("{\"action\":\"reboot\",\"ok\":true}");
-      skm_service_free(service); skm_snapshot_free(snapshot);
-      sync();
-      reboot(RB_AUTOBOOT);
-      return response; /* unreachable, but keeps compiler happy */
+      if (out_post_action != NULL) *out_post_action = SKM_POST_ACTION_REBOOT;
     } else if (g_strcmp0(act, "poweroff") == 0 || g_strcmp0(act, "shutdown") == 0) {
       response = g_strdup("{\"action\":\"poweroff\",\"ok\":true}");
-      skm_service_free(service); skm_snapshot_free(snapshot);
-      sync();
-      reboot(RB_POWER_OFF);
-      return response;
+      if (out_post_action != NULL) *out_post_action = SKM_POST_ACTION_POWEROFF;
     } else {
       *out_status = 422;
       response = skm_build_json_detail(422, "Unknown power action.");
@@ -2352,6 +2564,7 @@ skm_remote_server_run(GThreadedSocketService *service,
   gboolean emit_notice = FALSE;
   SkmService *snapshot_service = NULL;
   SkmSnapshot *snapshot = NULL;
+  SkmPostAction post_action = SKM_POST_ACTION_NONE;
 
   (void) service;
   (void) source_object;
@@ -2462,7 +2675,8 @@ skm_remote_server_run(GThreadedSocketService *service,
     peer_ip,
     &status,
     &notice_success,
-    &notice_message);
+    &notice_message,
+    &post_action);
   if (notice_message != NULL) {
     skm_remote_emit_notice(server, notice_success, notice_success, notice_message);
   }
@@ -2482,6 +2696,18 @@ done:
   }
   g_io_stream_close(G_IO_STREAM(connection), NULL, NULL);
   (void) emit_notice;
+
+  /* Now that the response has been flushed and the TCP connection closed,
+   * it is safe to initiate the reboot/poweroff. The client will have seen a
+   * clean 200 instead of a half-written response followed by RST. */
+  if (post_action == SKM_POST_ACTION_REBOOT) {
+    sync();
+    reboot(RB_AUTOBOOT);
+  } else if (post_action == SKM_POST_ACTION_POWEROFF) {
+    sync();
+    reboot(RB_POWER_OFF);
+  }
+
   return TRUE;
 }
 

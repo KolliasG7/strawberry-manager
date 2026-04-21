@@ -100,8 +100,19 @@ skm_refresh_remote_server(SkmAppWindow *self, gboolean user_initiated)
     return;
   }
 
-  /* Always (re-)apply password before starting so a settings change takes effect */
-  skm_remote_server_set_password(self->remote_server, self->settings.remote_password);
+  /* skm_remote_server_sync_settings() above has already applied either the
+   * fresh plaintext (when the user just changed the password in the Settings
+   * dialog) or the stored salt+hash (the usual startup path). Calling
+   * set_password(self->settings.remote_password) unconditionally would pass
+   * NULL after migration — because sync_settings wipes the in-memory plaintext
+   * once it's been absorbed — and that would silently clear auth_token, salt,
+   * and hash on every launch, dropping the listener back to loopback-only.
+   * So only rotate the password here if the user actually supplied a new
+   * plaintext this cycle. */
+  if (self->settings.remote_password != NULL &&
+      *self->settings.remote_password != '\0') {
+    skm_remote_server_set_password(self->remote_server, self->settings.remote_password);
+  }
 
   if (skm_remote_server_is_running(self->remote_server) &&
       skm_remote_server_get_port(self->remote_server) == self->settings.remote_port) {
