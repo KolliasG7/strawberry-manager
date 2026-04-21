@@ -71,10 +71,10 @@ static guint64 g_cpu_prev_total = 0;
 static guint64 g_cpu_prev_idle  = 0;
 static gdouble g_cpu_percent    = 0.0;
 
-/* ── PTY terminal singleton ─────────────────────────────────────────────── */
-static GMutex g_term_mutex;
-static int    g_term_master_fd = -1;
-static pid_t  g_term_pid       = -1;
+/* ── PTY terminal ────────────────────────────────────────────────────────
+ * Each /ws/terminal connection gets its own bash + pty. No global state —
+ * two simultaneous clients can no longer see each other's output, and a
+ * disconnected shell doesn't persist to leak into the next client. */
 
 typedef struct {
   guint64 rx_bytes;
@@ -823,29 +823,21 @@ skm_tunnel_any_running(const gchar * const *names)
 
 /* ── PTY terminal helpers ───────────────────────────────────────────────── */
 
-static void
-skm_term_ensure(void)
+/* Spawn a fresh login bash attached to a new pty for this single connection.
+ * On success *out_master_fd is non-blocking and *out_pid is a live child.
+ * On failure both are -1 and errno reflects the first syscall that failed. */
+static gboolean
+skm_term_spawn(int *out_master_fd, pid_t *out_pid)
 {
-  g_mutex_lock(&g_term_mutex);
-  if (g_term_pid > 0) {
-    if (kill(g_term_pid, 0) == 0) {
-      g_mutex_unlock(&g_term_mutex);
-      return; /* already alive */
-    }
-    close(g_term_master_fd);
-    g_term_master_fd = -1;
-    g_term_pid = -1;
-  }
+  *out_master_fd = -1;
+  *out_pid = -1;
 
-  int master_fd, slave_fd;
-  if (openpty(&master_fd, &slave_fd, NULL, NULL, NULL) < 0) {
-    g_mutex_unlock(&g_term_mutex);
-    return;
-  }
+  int master_fd = -1, slave_fd = -1;
+  if (openpty(&master_fd, &slave_fd, NULL, NULL, NULL) < 0) return FALSE;
 
-  /* set non-blocking on master */
+  /* set non-blocking on master so poll() alone drives I/O */
   int fl = fcntl(master_fd, F_GETFL, 0);
-  fcntl(master_fd, F_SETFL, fl | O_NONBLOCK);
+  if (fl >= 0) fcntl(master_fd, F_SETFL, fl | O_NONBLOCK);
 
   pid_t pid = fork();
   if (pid == 0) {
@@ -881,11 +873,33 @@ skm_term_ensure(void)
     execle("/bin/bash", "/bin/bash", "--login", NULL, env);
     _exit(1);
   }
+
   close(slave_fd);
-  if (pid < 0) { close(master_fd); g_mutex_unlock(&g_term_mutex); return; }
-  g_term_master_fd = master_fd;
-  g_term_pid       = pid;
-  g_mutex_unlock(&g_term_mutex);
+  if (pid < 0) { close(master_fd); return FALSE; }
+
+  *out_master_fd = master_fd;
+  *out_pid = pid;
+  return TRUE;
+}
+
+/* Tear down the per-connection shell at disconnect. Sends SIGHUP, waits up
+ * to ~500 ms for a clean exit, then SIGKILL + reap. Safe to call with
+ * master_fd == -1 / pid == -1 (no-op). */
+static void
+skm_term_teardown(int master_fd, pid_t pid)
+{
+  if (master_fd >= 0) close(master_fd);
+  if (pid <= 0) return;
+
+  kill(pid, SIGHUP);
+  for (int i = 0; i < 10; i++) {
+    int status = 0;
+    pid_t r = waitpid(pid, &status, WNOHANG);
+    if (r == pid || r < 0) return;
+    g_usleep(50 * 1000);
+  }
+  kill(pid, SIGKILL);
+  waitpid(pid, NULL, 0);
 }
 
 
@@ -2574,20 +2588,18 @@ skm_handle_ws_terminal(GSocketConnection *connection, GHashTable *headers)
   if (!skm_ws_send_handshake(output, key))
     return FALSE;
 
-  skm_term_ensure();
-
-  g_mutex_lock(&g_term_mutex);
-  int master_fd = g_term_master_fd;
-  g_mutex_unlock(&g_term_mutex);
-
-  if (master_fd < 0) {
+  int master_fd = -1;
+  pid_t term_pid = -1;
+  if (!skm_term_spawn(&master_fd, &term_pid)) {
     skm_ws_write_text(output, "Failed to spawn shell.\r\n");
+    skm_ws_write_frame(output, 0x8, NULL, 0);
     return FALSE;
   }
 
   /* Run until WS disconnects or pty dies.
    * We do a simple poll loop: read pty → send WS frame,
-   * read WS frame → write pty. */
+   * read WS frame → write pty. The shell is this connection's alone and
+   * will be reaped via skm_term_teardown() on any exit path below. */
   struct pollfd pfd[2];
   guint8 buf[4096];
 
@@ -2660,17 +2672,23 @@ skm_handle_ws_terminal(GSocketConnection *connection, GHashTable *headers)
             skm_json_extract_int((const gchar *) payload, "rows", &rows)) {
           struct winsize ws2 = { (unsigned short)rows, (unsigned short)cols, 0, 0 };
           ioctl(master_fd, TIOCSWINSZ, &ws2);
-          kill(g_term_pid, SIGWINCH);
+          kill(term_pid, SIGWINCH);
           g_free(payload);
           continue;
         }
       }
 
-      if (payload_len > 0)
-        write(master_fd, payload, payload_len);
+      if (payload_len > 0) {
+        ssize_t w = write(master_fd, payload, payload_len);
+        (void) w; /* best-effort — next poll iteration will observe EIO/EOF */
+      }
       g_free(payload);
     }
   }
+
+  /* Politely close the WS then tear down this connection's shell. */
+  skm_ws_write_frame(output, 0x8, NULL, 0);
+  skm_term_teardown(master_fd, term_pid);
   return TRUE;
 }
 
