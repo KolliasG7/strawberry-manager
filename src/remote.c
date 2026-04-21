@@ -39,6 +39,16 @@
 #define SKM_REMOTE_PROCESS_LIMIT_MAX 200
 #define SKM_REMOTE_OPEN_TOKEN "open-access"
 
+/* Login rate limiting: after this many failures in a row a peer is locked out
+ * for SKM_LOGIN_LOCKOUT_SECONDS. Each failed attempt also sleeps briefly to
+ * cap wall-clock brute force speed regardless of parallel workers. */
+#define SKM_LOGIN_FAIL_LIMIT       10
+#define SKM_LOGIN_LOCKOUT_SECONDS  300
+#define SKM_LOGIN_FAIL_SLEEP_US    500000  /* 0.5s */
+
+/* HMAC salt length in raw bytes (hex-encoded for on-disk storage). */
+#define SKM_HMAC_SALT_BYTES 16
+
 /* ── CPU delta tracking (protected by g_cpu_mutex) ─────────────────────── */
 static GMutex  g_cpu_mutex;
 static guint64 g_cpu_prev_total = 0;
@@ -55,6 +65,11 @@ typedef struct {
   guint64 tx_bytes;
 } SkmRemoteNetCounter;
 
+typedef struct {
+  gint64 locked_until_us; /* 0 = not locked */
+  gint   fail_count;
+} SkmLoginAttempt;
+
 struct _SkmRemoteServer {
   GThreadedSocketService *service;
   gint port;
@@ -65,8 +80,12 @@ struct _SkmRemoteServer {
   guint64 total_connections;
   gchar *last_client;
   gboolean auth_required;
-  gchar *auth_password;
+  /* HMAC-SHA256(password, salt) hex digest. Compared against submitted tokens
+   * in constant time. The plaintext password is never held in memory after
+   * skm_remote_server_set_password() returns. */
   gchar *auth_token;
+  GMutex login_lock;
+  GHashTable *login_attempts; /* char* peer_ip -> SkmLoginAttempt* */
   gboolean cpu_prev_valid;
   guint64 cpu_prev_total;
   guint64 cpu_prev_idle;
@@ -93,7 +112,9 @@ skm_app_settings_clear(SkmAppSettings *settings)
     return;
   }
 
-  g_clear_pointer(&settings->remote_password, g_free);
+  g_clear_pointer(&settings->remote_password,      g_free);
+  g_clear_pointer(&settings->remote_hmac_salt,     g_free);
+  g_clear_pointer(&settings->remote_password_hash, g_free);
 }
 
 static void
@@ -131,6 +152,10 @@ skm_app_settings_assign(SkmAppSettings *dest, const SkmAppSettings *src)
   dest->remote_port = src->remote_port;
   g_clear_pointer(&dest->remote_password, g_free);
   dest->remote_password = g_strdup(src->remote_password);
+  g_clear_pointer(&dest->remote_hmac_salt, g_free);
+  dest->remote_hmac_salt = g_strdup(src->remote_hmac_salt);
+  g_clear_pointer(&dest->remote_password_hash, g_free);
+  dest->remote_password_hash = g_strdup(src->remote_password_hash);
   skm_app_settings_clamp(dest);
 }
 
@@ -145,6 +170,47 @@ skm_hmac_sha256_hex(const gchar *password, const gchar *data)
   gchar *hex = g_strdup(g_hmac_get_string(hmac));
   g_hmac_unref(hmac);
   return hex;
+}
+
+/* Constant-time string comparison. Walks the longer of the two strings so
+ * running time does not leak information about which byte differs. Returns
+ * TRUE if both inputs are non-NULL and byte-wise equal. */
+static gboolean
+skm_token_equal(const gchar *a, const gchar *b)
+{
+  if (a == NULL || b == NULL) {
+    return FALSE;
+  }
+
+  gsize la = strlen(a);
+  gsize lb = strlen(b);
+  gsize n  = la > lb ? la : lb;
+  guint diff = (guint) (la ^ lb);
+
+  for (gsize i = 0; i < n; i++) {
+    guchar ca = (i < la) ? (guchar) a[i] : 0;
+    guchar cb = (i < lb) ? (guchar) b[i] : 0;
+    diff |= (guint) (ca ^ cb);
+  }
+
+  return diff == 0;
+}
+
+/* Generate SKM_HMAC_SALT_BYTES random bytes as a lower-case hex string. */
+static gchar *
+skm_generate_hmac_salt(void)
+{
+  guint8 raw[SKM_HMAC_SALT_BYTES];
+  GString *hex = NULL;
+
+  for (gsize i = 0; i < SKM_HMAC_SALT_BYTES; i++) {
+    raw[i] = (guint8) g_random_int_range(0, 256);
+  }
+  hex = g_string_sized_new(SKM_HMAC_SALT_BYTES * 2);
+  for (gsize i = 0; i < SKM_HMAC_SALT_BYTES; i++) {
+    g_string_append_printf(hex, "%02x", raw[i]);
+  }
+  return g_string_free(hex, FALSE);
 }
 
 /* ── CPU% reader (/proc/stat delta) ────────────────────────────────────── */
@@ -982,6 +1048,85 @@ skm_remote_identify_peer(GSocketConnection *connection)
   return g_strdup("unknown");
 }
 
+/* Extract just the bare IP from an "ip:port" peer string for rate-limiting
+ * purposes — port would make each login attempt unique and defeat the limit.
+ * Returns newly-allocated string; caller frees. */
+static gchar *
+skm_remote_peer_ip(const gchar *peer)
+{
+  if (peer == NULL) {
+    return g_strdup("unknown");
+  }
+
+  /* IPv6 peers come formatted as "[::1]:12345"; strip brackets + port. */
+  if (peer[0] == '[') {
+    const gchar *end = strchr(peer, ']');
+    if (end != NULL) {
+      return g_strndup(peer + 1, (gsize) (end - peer - 1));
+    }
+  }
+
+  const gchar *colon = strrchr(peer, ':');
+  if (colon != NULL) {
+    return g_strndup(peer, (gsize) (colon - peer));
+  }
+
+  return g_strdup(peer);
+}
+
+/* ── Login rate limit (protected by server->login_lock) ───────────── */
+
+static gboolean
+skm_login_is_locked(SkmRemoteServer *server, const gchar *peer_ip)
+{
+  gboolean locked = FALSE;
+  if (server == NULL || peer_ip == NULL || server->login_attempts == NULL) {
+    return FALSE;
+  }
+
+  g_mutex_lock(&server->login_lock);
+  SkmLoginAttempt *a = g_hash_table_lookup(server->login_attempts, peer_ip);
+  if (a != NULL && a->locked_until_us > 0 &&
+      g_get_monotonic_time() < a->locked_until_us) {
+    locked = TRUE;
+  }
+  g_mutex_unlock(&server->login_lock);
+  return locked;
+}
+
+static void
+skm_login_record_failure(SkmRemoteServer *server, const gchar *peer_ip)
+{
+  if (server == NULL || peer_ip == NULL || server->login_attempts == NULL) {
+    return;
+  }
+
+  g_mutex_lock(&server->login_lock);
+  SkmLoginAttempt *a = g_hash_table_lookup(server->login_attempts, peer_ip);
+  if (a == NULL) {
+    a = g_new0(SkmLoginAttempt, 1);
+    g_hash_table_insert(server->login_attempts, g_strdup(peer_ip), a);
+  }
+  a->fail_count++;
+  if (a->fail_count >= SKM_LOGIN_FAIL_LIMIT) {
+    a->locked_until_us = g_get_monotonic_time() +
+      (gint64) SKM_LOGIN_LOCKOUT_SECONDS * G_USEC_PER_SEC;
+  }
+  g_mutex_unlock(&server->login_lock);
+}
+
+static void
+skm_login_record_success(SkmRemoteServer *server, const gchar *peer_ip)
+{
+  if (server == NULL || peer_ip == NULL || server->login_attempts == NULL) {
+    return;
+  }
+
+  g_mutex_lock(&server->login_lock);
+  g_hash_table_remove(server->login_attempts, peer_ip);
+  g_mutex_unlock(&server->login_lock);
+}
+
 static gchar *
 skm_remote_shorten_agent(const gchar *user_agent)
 {
@@ -1215,7 +1360,7 @@ skm_build_settings_json(SkmRemoteServer *server)
     server->settings.fan_debounce_ms,
     server->settings.remote_enabled ? "true" : "false",
     server->settings.remote_port,
-    server->settings.remote_password != NULL ? "\"***\"" : "null",
+    server->settings.remote_password_hash != NULL ? "\"***\"" : "null",
     server->auth_required ? "true" : "false");
 }
 
@@ -1320,10 +1465,77 @@ skm_build_processes_json(gint limit, const gchar *sort_by)
   return g_string_free(json, FALSE);
 }
 
+/* Allowlist of filesystem roots the /api/files endpoints may access.
+ * Every user-supplied path is resolved with realpath() and rejected unless it
+ * lands under one of these prefixes. This blocks the classic `..` traversal
+ * and absolute-path tricks without requiring chroot. */
+static const gchar *
+skm_files_allowed_roots[] = {
+  "/home",
+  "/mnt",
+  "/media",
+  "/tmp",
+  "/var/tmp",
+  "/data",
+  "/storage",
+  NULL,
+};
+
+/* Resolve a caller-supplied path to its canonical form and confirm it lives
+ * under the allowlist above. Returns newly-allocated canonical path on
+ * success, or NULL on rejection (sets out_reason to a static, user-safe
+ * diagnostic). */
+static gchar *
+skm_files_validate_path(const gchar *input, const gchar **out_reason)
+{
+  if (out_reason != NULL) *out_reason = NULL;
+
+  if (input == NULL || *input == '\0') {
+    if (out_reason != NULL) *out_reason = "Path required.";
+    return NULL;
+  }
+
+  /* Reject relative paths outright — we don't trust the daemon's cwd. */
+  if (input[0] != '/') {
+    if (out_reason != NULL) *out_reason = "Absolute path required.";
+    return NULL;
+  }
+
+  g_autofree gchar *canonical = g_canonicalize_filename(input, NULL);
+  if (canonical == NULL) {
+    if (out_reason != NULL) *out_reason = "Path not accessible.";
+    return NULL;
+  }
+
+  for (gsize i = 0; skm_files_allowed_roots[i] != NULL; i++) {
+    const gchar *root = skm_files_allowed_roots[i];
+    gsize rlen = strlen(root);
+    if (g_strcmp0(canonical, root) == 0) {
+      return g_steal_pointer(&canonical);
+    }
+    if (g_str_has_prefix(canonical, root) && canonical[rlen] == '/') {
+      return g_steal_pointer(&canonical);
+    }
+  }
+
+  if (out_reason != NULL) *out_reason = "Path is outside the allowed roots.";
+  return NULL;
+}
+
 static gchar *
 skm_build_files_json(const gchar *path)
 {
-  const gchar *safe_path = (path != NULL && *path != '\0') ? path : "/";
+  const gchar *reason = NULL;
+  g_autofree gchar *safe_path = skm_files_validate_path(
+    (path != NULL && *path != '\0') ? path : "/home",
+    &reason);
+  if (safe_path == NULL) {
+    g_autofree gchar *escaped_reason = skm_json_escape(reason ? reason : "Path not allowed.");
+    return g_strdup_printf(
+      "{\"error\":\"%s\",\"items\":[]}",
+      escaped_reason);
+  }
+
   GDir *dir = g_dir_open(safe_path, 0, NULL);
   GString *json = g_string_new(NULL);
   g_autofree gchar *escaped_path = skm_json_escape(safe_path);
@@ -1520,21 +1732,6 @@ skm_ws_send_handshake(GOutputStream *output, const gchar *key)
   return g_output_stream_flush(output, NULL, NULL);
 }
 
-static gboolean
-skm_ws_read_and_discard(GInputStream *input)
-{
-  guint8 buffer[4096];
-
-  for (;;) {
-    gssize bytes = g_input_stream_read(input, buffer, sizeof(buffer), NULL, NULL);
-
-    if (bytes <= 0) {
-      return FALSE;
-    }
-  }
-}
-
-
 static SkmOperationResult *
 skm_handle_settings_action(SkmRemoteServer *server, GHashTable *values)
 {
@@ -1564,21 +1761,42 @@ skm_handle_settings_action(SkmRemoteServer *server, GHashTable *values)
     updated.remote_enabled ? 1 : 0) != 0;
   updated.remote_port = skm_form_get_int(values, "remote_port", updated.remote_port);
   password = g_hash_table_lookup(values, "remote_password");
+  /* `password` is plaintext (pre-hash). Re-derive salt+hash for the persisted
+   * form and drop plaintext before save. NULL = field omitted (keep auth as-is);
+   * ""  = clear auth; non-empty = rotate. */
   g_clear_pointer(&updated.remote_password, g_free);
-  updated.remote_password = (password != NULL && *password != '\0')
-    ? g_strdup(password)
-    : NULL;
+  if (password != NULL) {
+    updated.remote_password = g_strdup(password);
+  }
   skm_app_settings_clamp(&updated);
 
-  password_changed = g_strcmp0(updated.remote_password, server->settings.remote_password) != 0;
+  if (password != NULL) {
+    gboolean had_auth = server->settings.remote_password_hash != NULL;
+    password_changed = (*password != '\0') ? TRUE : had_auth;
+    g_clear_pointer(&updated.remote_hmac_salt, g_free);
+    g_clear_pointer(&updated.remote_password_hash, g_free);
+    if (*password != '\0') {
+      updated.remote_hmac_salt = skm_generate_hmac_salt();
+      updated.remote_password_hash = skm_hmac_sha256_hex(password, updated.remote_hmac_salt);
+    }
+  }
   port_changed = updated.remote_port != server->settings.remote_port;
 
   if (!skm_settings_save(&updated, server->settings_path, &error)) {
+    if (updated.remote_password != NULL) {
+      memset(updated.remote_password, 0, strlen(updated.remote_password));
+    }
     skm_app_settings_clear(&updated);
     return skm_operation_result_new(FALSE, FALSE, error->message);
   }
 
   skm_remote_server_sync_settings(server, &updated, server->settings_path);
+  /* Plaintext has done its job; wipe it from both copies. */
+  if (updated.remote_password != NULL) {
+    memset(updated.remote_password, 0, strlen(updated.remote_password));
+  }
+  g_clear_pointer(&updated.remote_password, g_free);
+  g_clear_pointer(&server->settings.remote_password, g_free);
 
   message = g_string_new(created_file ? "settings.ini created." : "settings.ini saved.");
   if (password_changed) {
@@ -1855,6 +2073,7 @@ skm_handle_api_request(SkmRemoteServer *server,
                        GHashTable *query,
                        GHashTable *values,
                        GHashTable *headers,
+                       const gchar *peer_ip,
                        gint *out_status,
                        gboolean *out_notice_success,
                        gchar **out_notice_message)
@@ -1874,16 +2093,25 @@ skm_handle_api_request(SkmRemoteServer *server,
       return g_strdup_printf("{\"token\":\"%s\",\"auth_required\":false}",
                              SKM_REMOTE_OPEN_TOKEN);
     }
+    if (skm_login_is_locked(server, peer_ip)) {
+      *out_status = 429;
+      return skm_build_json_detail(429, "Too many failed attempts. Try again later.");
+    }
     const gchar *submitted = g_hash_table_lookup(values, "password");
     if (submitted == NULL || *submitted == '\0') {
       *out_status = 401;
       return skm_build_json_detail(401, "Password required.");
     }
-    g_autofree gchar *submitted_token = skm_hmac_sha256_hex(submitted, "braska_v1");
-    if (!g_str_equal(submitted_token, server->auth_token)) {
+    g_autofree gchar *submitted_token = (server->settings.remote_hmac_salt != NULL)
+      ? skm_hmac_sha256_hex(submitted, server->settings.remote_hmac_salt)
+      : NULL;
+    if (submitted_token == NULL || !skm_token_equal(submitted_token, server->auth_token)) {
+      skm_login_record_failure(server, peer_ip);
+      g_usleep(SKM_LOGIN_FAIL_SLEEP_US);
       *out_status = 401;
       return skm_build_json_detail(401, "Wrong password.");
     }
+    skm_login_record_success(server, peer_ip);
     return g_strdup_printf("{\"token\":\"%s\",\"auth_required\":true}",
                            server->auth_token);
   }
@@ -1908,7 +2136,7 @@ skm_handle_api_request(SkmRemoteServer *server,
     else if (headers != NULL)
       bearer = g_hash_table_lookup(headers, "token"); /* WS query param fallback */
 
-    if (bearer == NULL || !g_str_equal(bearer, server->auth_token)) {
+    if (bearer == NULL || !skm_token_equal(bearer, server->auth_token)) {
       *out_status = 401;
       return skm_build_json_detail(401, "Invalid or missing token.");
     }
@@ -2188,7 +2416,7 @@ skm_remote_server_run(GThreadedSocketService *service,
     /* Auth guard for WS endpoints */
     if (server->auth_required) {
       const gchar *bearer = g_hash_table_lookup(headers, "token");
-      if (bearer == NULL || !g_str_equal(bearer, server->auth_token)) {
+      if (bearer == NULL || !skm_token_equal(bearer, server->auth_token)) {
         skm_write_response(output, 401, "application/json; charset=utf-8",
                            skm_build_json_detail(401, "Unauthorized"));
         g_io_stream_close(G_IO_STREAM(connection), NULL, NULL);
@@ -2223,6 +2451,7 @@ skm_remote_server_run(GThreadedSocketService *service,
   }
 
   values = skm_values_from_json_or_form(g_hash_table_lookup(headers, "content-type"), body);
+  g_autofree gchar *peer_ip = skm_remote_peer_ip(peer);
   response_body = skm_handle_api_request(
     server,
     method,
@@ -2230,6 +2459,7 @@ skm_remote_server_run(GThreadedSocketService *service,
     query,
     values,
     headers,
+    peer_ip,
     &status,
     &notice_success,
     &notice_message);
@@ -2259,15 +2489,49 @@ SkmRemoteServer *
 skm_remote_server_new(SkmRemoteNoticeFunc notice_cb, gpointer user_data)
 {
   SkmRemoteServer *server = g_new0(SkmRemoteServer, 1);
-  g_autofree gchar *password = NULL;
+  gboolean migrated = FALSE;
 
   server->notice_cb = notice_cb;
   server->notice_user_data = user_data;
   server->recent_clients = g_ptr_array_new_with_free_func(g_free);
-  skm_settings_load(&server->settings, &server->settings_path, NULL);
-  password = g_strdup(server->settings.remote_password);
-  skm_remote_server_set_password(server, password);
   g_mutex_init(&server->lock);
+  g_mutex_init(&server->login_lock);
+  server->login_attempts = g_hash_table_new_full(
+    g_str_hash, g_str_equal, g_free, g_free);
+
+  skm_settings_load(&server->settings, &server->settings_path, NULL);
+
+  /* Legacy migration: older settings.ini stored remote_password in plaintext.
+   * Derive a per-install salt + hash once, then drop plaintext on next save. */
+  if (server->settings.remote_password != NULL &&
+      server->settings.remote_password_hash == NULL) {
+    g_clear_pointer(&server->settings.remote_hmac_salt, g_free);
+    server->settings.remote_hmac_salt = skm_generate_hmac_salt();
+    server->settings.remote_password_hash = skm_hmac_sha256_hex(
+      server->settings.remote_password,
+      server->settings.remote_hmac_salt);
+    migrated = TRUE;
+  }
+
+  if (server->settings.remote_password_hash != NULL &&
+      server->settings.remote_hmac_salt != NULL) {
+    server->auth_required = TRUE;
+    server->auth_token = g_strdup(server->settings.remote_password_hash);
+  } else {
+    server->auth_required = FALSE;
+  }
+
+  /* Wipe any plaintext we only read to trigger migration. */
+  if (server->settings.remote_password != NULL) {
+    memset(server->settings.remote_password, 0,
+           strlen(server->settings.remote_password));
+    g_clear_pointer(&server->settings.remote_password, g_free);
+  }
+
+  if (migrated && server->settings_path != NULL) {
+    skm_settings_save(&server->settings, server->settings_path, NULL);
+  }
+
   return server;
 }
 
@@ -2276,16 +2540,22 @@ skm_remote_server_set_password(SkmRemoteServer *server, const gchar *password)
 {
   g_return_if_fail(server != NULL);
 
-  g_clear_pointer(&server->auth_password, g_free);
-  g_clear_pointer(&server->auth_token,    g_free);
-  g_clear_pointer(&server->settings.remote_password, g_free);
+  g_clear_pointer(&server->auth_token, g_free);
 
   if (password != NULL && *password != '\0') {
+    /* Generate a fresh salt on each rotation so old leaked hashes can't be
+     * reused, and update the in-memory settings so the next save persists
+     * the new values (plaintext is never stored). */
+    g_clear_pointer(&server->settings.remote_hmac_salt, g_free);
+    g_clear_pointer(&server->settings.remote_password_hash, g_free);
+    server->settings.remote_hmac_salt = skm_generate_hmac_salt();
+    server->settings.remote_password_hash = skm_hmac_sha256_hex(
+      password, server->settings.remote_hmac_salt);
     server->auth_required = TRUE;
-    server->auth_password = g_strdup(password);
-    server->auth_token    = skm_hmac_sha256_hex(password, "braska_v1");
-    server->settings.remote_password = g_strdup(password);
+    server->auth_token = g_strdup(server->settings.remote_password_hash);
   } else {
+    g_clear_pointer(&server->settings.remote_hmac_salt, g_free);
+    g_clear_pointer(&server->settings.remote_password_hash, g_free);
     server->auth_required = FALSE;
   }
 }
@@ -2295,7 +2565,6 @@ skm_remote_server_sync_settings(SkmRemoteServer *server,
                                 const SkmAppSettings *settings,
                                 const gchar *settings_path)
 {
-  g_autofree gchar *password = NULL;
   g_autofree gchar *path_copy = NULL;
 
   g_return_if_fail(server != NULL);
@@ -2307,8 +2576,29 @@ skm_remote_server_sync_settings(SkmRemoteServer *server,
     g_clear_pointer(&server->settings_path, g_free);
     server->settings_path = g_steal_pointer(&path_copy);
   }
-  password = g_strdup(server->settings.remote_password);
-  skm_remote_server_set_password(server, password);
+
+  /* If the caller supplied a plaintext password, rotate through
+   * set_password() which regenerates salt+hash. Otherwise, adopt whatever
+   * hashed form was passed in (may be NULL to disable auth). */
+  if (server->settings.remote_password != NULL &&
+      *server->settings.remote_password != '\0') {
+    g_autofree gchar *plaintext = g_strdup(server->settings.remote_password);
+    memset(server->settings.remote_password, 0,
+           strlen(server->settings.remote_password));
+    g_clear_pointer(&server->settings.remote_password, g_free);
+    skm_remote_server_set_password(server, plaintext);
+    memset(plaintext, 0, strlen(plaintext));
+  } else {
+    g_clear_pointer(&server->auth_token, g_free);
+    if (server->settings.remote_password_hash != NULL &&
+        server->settings.remote_hmac_salt != NULL) {
+      server->auth_required = TRUE;
+      server->auth_token = g_strdup(server->settings.remote_password_hash);
+    } else {
+      server->auth_required = FALSE;
+    }
+    g_clear_pointer(&server->settings.remote_password, g_free);
+  }
 }
 
 void
@@ -2320,9 +2610,10 @@ skm_remote_server_free(SkmRemoteServer *server)
 
   skm_remote_server_stop(server);
   g_mutex_clear(&server->lock);
+  g_mutex_clear(&server->login_lock);
+  g_clear_pointer(&server->login_attempts, g_hash_table_unref);
   g_clear_pointer(&server->recent_clients, g_ptr_array_unref);
   g_clear_pointer(&server->last_client,    g_free);
-  g_clear_pointer(&server->auth_password,  g_free);
   g_clear_pointer(&server->auth_token,     g_free);
   g_clear_pointer(&server->settings_path,  g_free);
   skm_app_settings_clear(&server->settings);
@@ -2343,13 +2634,36 @@ skm_remote_server_start(SkmRemoteServer *server, gint port, GError **error)
   server->service = G_THREADED_SOCKET_SERVICE(g_threaded_socket_service_new(8));
   g_signal_connect(server->service, "run", G_CALLBACK(skm_remote_server_run), server);
 
-  if (!g_socket_listener_add_inet_port(
-        G_SOCKET_LISTENER(server->service),
-        (guint16) port,
-        NULL,
-        error)) {
-    g_clear_object(&server->service);
-    return FALSE;
+  if (server->auth_required) {
+    /* Password is set — it's safe to accept connections from any interface. */
+    if (!g_socket_listener_add_inet_port(
+          G_SOCKET_LISTENER(server->service),
+          (guint16) port,
+          NULL,
+          error)) {
+      g_clear_object(&server->service);
+      return FALSE;
+    }
+  } else {
+    /* No password configured. The server exposes power-off/reboot,
+     * process kill, sysfs writes, etc. — binding to the world would be
+     * catastrophic on a shared LAN. Restrict to loopback so the user must
+     * intentionally tunnel (SSH, VPN) to reach it. */
+    g_autoptr(GInetAddress) loopback =
+      g_inet_address_new_loopback(G_SOCKET_FAMILY_IPV4);
+    g_autoptr(GSocketAddress) sockaddr =
+      g_inet_socket_address_new(loopback, (guint16) port);
+    if (!g_socket_listener_add_address(
+          G_SOCKET_LISTENER(server->service),
+          sockaddr,
+          G_SOCKET_TYPE_STREAM,
+          G_SOCKET_PROTOCOL_TCP,
+          NULL,
+          NULL,
+          error)) {
+      g_clear_object(&server->service);
+      return FALSE;
+    }
   }
 
   g_socket_service_start(G_SOCKET_SERVICE(server->service));

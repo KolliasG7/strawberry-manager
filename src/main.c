@@ -73,6 +73,14 @@ main(int argc, char **argv)
     return 1;
   }
 
+  if (port_override != 0 &&
+      (port_override < SKM_REMOTE_PORT_MIN || port_override > SKM_REMOTE_PORT_MAX)) {
+    g_printerr(
+      "Invalid --port %d: must be between %d and %d.\n",
+      port_override, SKM_REMOTE_PORT_MIN, SKM_REMOTE_PORT_MAX);
+    return 2;
+  }
+
   skm_settings_load(&settings, NULL, NULL);
   if (headless) {
     return skm_remote_run_headless(&settings, port_override);

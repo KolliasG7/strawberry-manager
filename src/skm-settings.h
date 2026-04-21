@@ -8,7 +8,17 @@ typedef struct {
   gint fan_debounce_ms;
   gboolean remote_enabled;
   gint remote_port;
-  gchar *remote_password; /* NULL = no auth; non-NULL = HMAC token required */
+  /* Legacy plaintext password slot. Kept only to migrate older settings.ini
+   * files to the hashed form below, then cleared. Never persisted going
+   * forward. */
+  gchar *remote_password;
+  /* Per-install random HMAC salt (hex). Generated on first run when a
+   * password is set; used to derive tokens. NULL when no password set. */
+  gchar *remote_hmac_salt;
+  /* HMAC-SHA256(password, salt) hex digest. This is what the daemon compares
+   * submitted passwords against — the plaintext password is never written
+   * to disk. NULL when no password set. */
+  gchar *remote_password_hash;
 } SkmAppSettings;
 
 enum {
