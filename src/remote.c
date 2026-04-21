@@ -231,6 +231,34 @@ skm_generate_hmac_salt(void)
 
 /* ── CPU% reader (/proc/stat delta) ────────────────────────────────────── */
 
+/* Per-core CPU baseline kept by a WS telemetry subscriber. A single entry
+ * covers one `cpuN` line from /proc/stat. The WS handler owns the array
+ * and passes it to skm_build_telemetry_json, so each subscriber computes
+ * its own delta and they don't fight over shared state. */
+typedef struct {
+  guint64 prev_total;
+  guint64 prev_idle;
+} SkmCpuCoreBaseline;
+
+/* Per-interface network byte baseline, same ownership pattern as the CPU
+ * core baselines above. `iface` is matched by name; a new interface coming
+ * online (e.g. a Wi-Fi dongle plugged in mid-session) is just appended. */
+typedef struct {
+  gchar   iface[32];
+  guint64 prev_rx;
+  guint64 prev_tx;
+  gint64  prev_ts_us;
+} SkmNetBaseline;
+
+/* Opaque bag of caller-owned deltas threaded through skm_build_telemetry_json.
+ * Kept on the WS handler's stack; lifetime matches the WS connection. */
+typedef struct {
+  guint64  cpu_prev_total;
+  guint64  cpu_prev_idle;
+  GArray  *cores;  /* element-type: SkmCpuCoreBaseline, index = core # */
+  GArray  *nets;   /* element-type: SkmNetBaseline */
+} SkmTelemetryState;
+
 /* Reads /proc/stat and computes CPU% against the caller's own previous
  * sample. Pass a pair of zero-initialised guint64s the first time — result
  * will be 0.0 on the first call and accurate thereafter. This variant is
@@ -267,6 +295,52 @@ skm_read_cpu_percent_local(guint64 *prev_total, guint64 *prev_idle)
   *prev_total = total;
   *prev_idle  = idle_total;
   return dtotal > 0 ? (1.0 - (gdouble) didle / (gdouble) dtotal) * 100.0 : 0.0;
+}
+
+/* Reads every `cpuN` line from /proc/stat and fills @out with one gdouble
+ * per core, computed against @cores[i]. @cores is grown as needed (matches
+ * the kernel's ordering, which is stable). First call yields 0.0s; second
+ * and later yield the real per-core %. */
+static void
+skm_read_cpu_per_core(GArray *cores, GArray *out)
+{
+  FILE *f = fopen("/proc/stat", "r");
+  gchar line[256];
+  guint index = 0;
+  g_array_set_size(out, 0);
+  if (f == NULL) return;
+  while (fgets(line, sizeof(line), f)) {
+    guint n;
+    guint64 user, nice, system, idle, iowait, irq, softirq, steal;
+    if (sscanf(line,
+         "cpu%u %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT
+         " %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT
+         " %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT,
+         &n, &user, &nice, &system, &idle, &iowait, &irq, &softirq, &steal) < 5) {
+      /* stop once we pass the cpuN block — subsequent lines (ctxt, btime…) */
+      if (index > 0) break;
+      else continue;
+    }
+    guint64 idle_total = idle + iowait;
+    guint64 total = user + nice + system + idle_total + irq + softirq + steal;
+
+    if (cores->len <= index) {
+      SkmCpuCoreBaseline zero = { 0 };
+      g_array_append_val(cores, zero);
+    }
+    SkmCpuCoreBaseline *b = &g_array_index(cores, SkmCpuCoreBaseline, index);
+    gdouble pct = 0.0;
+    if (b->prev_total != 0) {
+      guint64 dtotal = total - b->prev_total;
+      guint64 didle  = idle_total - b->prev_idle;
+      pct = dtotal > 0 ? (1.0 - (gdouble) didle / (gdouble) dtotal) * 100.0 : 0.0;
+    }
+    b->prev_total = total;
+    b->prev_idle  = idle_total;
+    g_array_append_val(out, pct);
+    index++;
+  }
+  fclose(f);
 }
 
 static gdouble
@@ -527,6 +601,73 @@ skm_read_processes(gint limit, const gchar *sort_by)
     total_ram_kb = ((gdouble) sys_info.totalram * (gdouble) sys_info.mem_unit) / 1024.0;
   }
 
+  /* First sample: read (utime+stime) per PID as of T0. We collect into a
+   * GHashTable keyed by PID so T1 can look up each PID's earlier tick
+   * count in O(1). Total-ticks snapshots /proc/stat at both samples so the
+   * per-process fraction has the right denominator. */
+  GHashTable *t0_ticks = g_hash_table_new(g_direct_hash, g_direct_equal);
+  guint64 t0_total = 0, t1_total = 0;
+  {
+    FILE *sf = fopen("/proc/stat", "r");
+    if (sf != NULL) {
+      guint64 u, n, s, id, iw, ir, sir, st;
+      if (fscanf(sf,
+           "cpu %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT
+           " %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT
+           " %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT,
+           &u, &n, &s, &id, &iw, &ir, &sir, &st) >= 4) {
+        t0_total = u + n + s + id + iw + ir + sir + st;
+      }
+      fclose(sf);
+    }
+  }
+  while ((ent = readdir(proc)) != NULL) {
+    if (ent->d_type != DT_DIR && ent->d_type != DT_UNKNOWN) continue;
+    if (!g_ascii_isdigit(ent->d_name[0])) continue;
+    gint pid = atoi(ent->d_name);
+    if (pid <= 0) continue;
+    gchar stat_path[64];
+    g_snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", pid);
+    FILE *sf = fopen(stat_path, "r");
+    if (sf == NULL) continue;
+    gulong u0 = 0, s0 = 0;
+    if (fscanf(sf, "%*d (%*[^)]) %*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu",
+               &u0, &s0) >= 2) {
+      g_hash_table_insert(t0_ticks,
+                          GINT_TO_POINTER(pid),
+                          GSIZE_TO_POINTER((gsize)(u0 + s0)));
+    }
+    fclose(sf);
+  }
+  closedir(proc);
+
+  /* Sleep ~100ms to give busy processes a detectable tick delta. This is
+   * long enough to see 1 tick at HZ=100, short enough that the iOS app
+   * doesn't notice — well under one telemetry-frame interval. */
+  g_usleep(100 * 1000);
+
+  /* Second sample — this is what actually populates the returned array. */
+  proc = opendir("/proc");
+  if (proc == NULL) {
+    g_hash_table_destroy(t0_ticks);
+    return arr;
+  }
+  {
+    FILE *sf = fopen("/proc/stat", "r");
+    if (sf != NULL) {
+      guint64 u, n, s, id, iw, ir, sir, st;
+      if (fscanf(sf,
+           "cpu %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT
+           " %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT
+           " %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT,
+           &u, &n, &s, &id, &iw, &ir, &sir, &st) >= 4) {
+        t1_total = u + n + s + id + iw + ir + sir + st;
+      }
+      fclose(sf);
+    }
+  }
+  guint64 dtotal = t1_total > t0_total ? t1_total - t0_total : 0;
+
   while ((ent = readdir(proc)) != NULL) {
     if (ent->d_type != DT_DIR && ent->d_type != DT_UNKNOWN) continue;
     if (!g_ascii_isdigit(ent->d_name[0])) continue;
@@ -557,29 +698,23 @@ skm_read_processes(gint limit, const gchar *sort_by)
       /* rss is in pages */
       e.rss_kb = (gulong)rss * (gulong)(sysconf(_SC_PAGESIZE) / 1024);
       e.mem_percent = total_ram_kb > 0.0 ? MIN(((gdouble) e.rss_kb / total_ram_kb) * 100.0, 100.0) : 0.0;
-      /* naive cpu_percent: (utime+stime) / uptime ticks — approximate */
-      e.cpu_percent = 0.0; /* filled below */
+      /* Real CPU%: paired delta against the T0 snapshot. Processes that
+       * didn't exist at T0 (fork'd during our 100ms sleep) simply look
+       * like they ran for the full 100ms window, which is close enough. */
+      gpointer prev_any = g_hash_table_lookup(t0_ticks, GINT_TO_POINTER(pid));
+      gulong prev_ticks = (gulong) GPOINTER_TO_SIZE(prev_any);
+      gulong cur_ticks  = (gulong)(utime + stime);
+      gulong dticks     = cur_ticks > prev_ticks ? cur_ticks - prev_ticks : 0;
+      e.cpu_percent = dtotal > 0
+        ? MIN(((gdouble) dticks / (gdouble) dtotal) * 100.0, 100.0)
+        : 0.0;
       skm_proc_read_details(&e);
       g_array_append_val(arr, e);
     }
     fclose(sf);
   }
   closedir(proc);
-
-  /* Compute approximate CPU% using total from /proc/stat */
-  g_mutex_lock(&g_cpu_mutex);
-  guint64 total_ticks = g_cpu_prev_total;
-  g_mutex_unlock(&g_cpu_mutex);
-  long hz = sysconf(_SC_CLK_TCK);
-  if (hz <= 0) hz = 100;
-
-  for (guint i = 0; i < arr->len; i++) {
-    SkmProcEntry *p = &g_array_index(arr, SkmProcEntry, i);
-    if (total_ticks > 0) {
-      p->cpu_percent = ((gdouble)(p->utime + p->stime) / (gdouble)total_ticks) * (gdouble)hz;
-      p->cpu_percent = MIN(p->cpu_percent, 100.0);
-    }
-  }
+  g_hash_table_destroy(t0_ticks);
 
   if (g_strcmp0(sort_by, "mem") == 0) {
     qsort(arr->data, arr->len, sizeof(SkmProcEntry), skm_proc_cmp_mem);
@@ -630,6 +765,55 @@ skm_read_net_dev(void)
   }
   fclose(f);
   return arr;
+}
+
+/* Look up (or lazily append) the per-interface baseline so the caller can
+ * compute bytes/s against its own previous sample. Matching is by name —
+ * interfaces don't get renumbered at runtime, and the kernel reuses names. */
+static SkmNetBaseline *
+skm_net_baseline_get(GArray *nets, const gchar *iface)
+{
+  for (guint i = 0; i < nets->len; i++) {
+    SkmNetBaseline *b = &g_array_index(nets, SkmNetBaseline, i);
+    if (g_strcmp0(b->iface, iface) == 0) return b;
+  }
+  SkmNetBaseline fresh = { 0 };
+  g_snprintf(fresh.iface, sizeof(fresh.iface), "%s", iface);
+  g_array_append_val(nets, fresh);
+  return &g_array_index(nets, SkmNetBaseline, nets->len - 1);
+}
+
+/* ── Tunnel probe (/proc scan for cloudflared / tailscaled) ─────────────── */
+
+/* Scan /proc/<pid>/comm for any process whose basename matches @names.
+ * Returns TRUE as soon as one is found; FALSE if none of the N names are
+ * live. This is a cheap substitute for `pgrep` that avoids spawning
+ * anything and works on the stripped userspace a PS4 Linux distro
+ * usually ships. */
+static gboolean
+skm_tunnel_any_running(const gchar * const *names)
+{
+  DIR *proc = opendir("/proc");
+  struct dirent *ent;
+  gboolean found = FALSE;
+  if (proc == NULL) return FALSE;
+  while ((ent = readdir(proc)) != NULL && !found) {
+    if (!g_ascii_isdigit(ent->d_name[0])) continue;
+    gchar comm_path[64];
+    g_snprintf(comm_path, sizeof(comm_path), "/proc/%s/comm", ent->d_name);
+    FILE *cf = fopen(comm_path, "r");
+    if (cf == NULL) continue;
+    gchar comm[64] = "";
+    if (fgets(comm, sizeof(comm), cf) != NULL) {
+      g_strchomp(comm);
+      for (gsize i = 0; names[i] != NULL; i++) {
+        if (g_strcmp0(comm, names[i]) == 0) { found = TRUE; break; }
+      }
+    }
+    fclose(cf);
+  }
+  closedir(proc);
+  return found;
 }
 
 /* ── PTY terminal helpers ───────────────────────────────────────────────── */
@@ -1461,7 +1645,15 @@ skm_build_fan_threshold_json(gint threshold, gboolean confirmed)
 static gchar *
 skm_build_tunnel_status_json(void)
 {
-  return g_strdup("{\"state\":\"stopped\",\"url\":null}");
+  /* No integration with cloudflared/tailscaled control sockets yet — we
+   * just report "running" when the relevant daemon process is live, so the
+   * iOS Connect screen's Tunnel mode stops showing a permanent "stopped"
+   * regardless of reality. @url is still null because we have no way to
+   * recover the assigned hostname without parsing cloudflared's logs or
+   * talking to tailscaled's LocalAPI. */
+  static const gchar * const names[] = { "cloudflared", "tailscaled", NULL };
+  const gchar *state = skm_tunnel_any_running(names) ? "running" : "stopped";
+  return g_strdup_printf("{\"state\":\"%s\",\"url\":null}", state);
 }
 
 static gchar *
@@ -1585,6 +1777,171 @@ skm_files_validate_path(const gchar *input, const gchar **out_reason)
   return NULL;
 }
 
+/* Validates an upload destination where the target file itself may not
+ * exist yet — realpath() would fail. Instead canonicalize the parent
+ * directory (which must exist and must be inside the allowlist) and
+ * append the basename. Rejects "." / ".." components up front so a caller
+ * can't traverse out of the parent via the joined path. */
+static gchar *
+skm_files_validate_upload_target(const gchar *input, const gchar **out_reason)
+{
+  if (out_reason != NULL) *out_reason = NULL;
+  if (input == NULL || *input == '\0') {
+    if (out_reason != NULL) *out_reason = "Path required.";
+    return NULL;
+  }
+  if (input[0] != '/') {
+    if (out_reason != NULL) *out_reason = "Absolute path required.";
+    return NULL;
+  }
+  /* Any "/.." or "/./" or terminal ".." is rejected before we split — this
+   * keeps the basename join below trivially safe. */
+  if (strstr(input, "/../") != NULL || strstr(input, "/./") != NULL ||
+      g_str_has_suffix(input, "/..") || g_str_has_suffix(input, "/.")) {
+    if (out_reason != NULL) *out_reason = "Path must not contain . or .. components.";
+    return NULL;
+  }
+  g_autofree gchar *parent = g_path_get_dirname(input);
+  g_autofree gchar *base   = g_path_get_basename(input);
+  if (base == NULL || *base == '\0' ||
+      g_strcmp0(base, ".") == 0 || g_strcmp0(base, "..") == 0 ||
+      strchr(base, '/') != NULL) {
+    if (out_reason != NULL) *out_reason = "Invalid filename.";
+    return NULL;
+  }
+  char *resolved_parent = realpath(parent, NULL);
+  g_autofree gchar *canon_parent = resolved_parent;
+  if (canon_parent == NULL) {
+    if (out_reason != NULL) *out_reason = "Parent directory does not exist.";
+    return NULL;
+  }
+  gboolean ok = FALSE;
+  for (gsize i = 0; skm_files_allowed_roots[i] != NULL; i++) {
+    const gchar *root = skm_files_allowed_roots[i];
+    gsize rlen = strlen(root);
+    if (g_strcmp0(canon_parent, root) == 0) { ok = TRUE; break; }
+    if (g_str_has_prefix(canon_parent, root) && canon_parent[rlen] == '/') { ok = TRUE; break; }
+  }
+  if (!ok) {
+    if (out_reason != NULL) *out_reason = "Path is outside the allowed roots.";
+    return NULL;
+  }
+  return g_build_filename(canon_parent, base, NULL);
+}
+
+/* Shared auth check mirroring the inline block at the top of
+ * skm_handle_api_request — lets the file streaming pre-dispatch do the
+ * same check without routing through the buffered-body code path. */
+static gboolean
+skm_remote_auth_check(SkmRemoteServer *server, GHashTable *headers)
+{
+  if (!server->auth_required) return TRUE;
+  if (headers == NULL) return FALSE;
+  const gchar *auth_header = g_hash_table_lookup(headers, "authorization");
+  const gchar *bearer = NULL;
+  if (auth_header != NULL && g_str_has_prefix(auth_header, "Bearer "))
+    bearer = auth_header + 7;
+  else
+    bearer = g_hash_table_lookup(headers, "token");
+  return bearer != NULL && skm_token_equal(bearer, server->auth_token);
+}
+
+/* Streams a file's contents to @output as a 200 response. Avoids loading
+ * the whole thing into memory so the daemon can serve multi-MB PS4 game
+ * saves or log dumps without blowing up its address space. */
+static gboolean
+skm_stream_file_response(GOutputStream *output, const gchar *safe_path)
+{
+  int fd = open(safe_path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return FALSE;
+  struct stat st;
+  if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+    close(fd);
+    return FALSE;
+  }
+  g_autofree gchar *base = g_path_get_basename(safe_path);
+  g_autofree gchar *header = g_strdup_printf(
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: application/octet-stream\r\n"
+    "Content-Length: %" G_GOFFSET_FORMAT "\r\n"
+    "Content-Disposition: attachment; filename=\"%s\"\r\n"
+    "Connection: close\r\n\r\n",
+    (goffset) st.st_size, base);
+  gsize ignored = 0;
+  if (!g_output_stream_write_all(output, header, strlen(header), &ignored, NULL, NULL)) {
+    close(fd);
+    return FALSE;
+  }
+  /* 64 KB chunks is a reasonable balance between syscall count and memory
+   * footprint — the PS4 has plenty of RAM so we're optimizing for not
+   * starving the daemon's other connections. */
+  guchar buf[64 * 1024];
+  for (;;) {
+    ssize_t n = read(fd, buf, sizeof(buf));
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      close(fd);
+      return FALSE;
+    }
+    if (n == 0) break;
+    if (!g_output_stream_write_all(output, buf, (gsize) n, &ignored, NULL, NULL)) {
+      close(fd);
+      return FALSE;
+    }
+  }
+  close(fd);
+  return TRUE;
+}
+
+/* Streams up to @content_length bytes from @input into @dest_path. Writes
+ * to a temp sibling first and rename()s on success so a partial transfer
+ * never replaces a good file — if the client hangs up mid-upload, the
+ * pre-existing file (if any) survives. */
+static gboolean
+skm_stream_upload_to_file(GInputStream *input,
+                          const gchar *dest_path,
+                          gsize content_length,
+                          gsize *out_written)
+{
+  if (out_written != NULL) *out_written = 0;
+  g_autofree gchar *tmp_path = g_strdup_printf("%s.skm-upload.%u", dest_path, g_random_int());
+  int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  if (fd < 0) return FALSE;
+  gsize remaining = content_length;
+  guchar buf[64 * 1024];
+  while (remaining > 0) {
+    gsize want = remaining > sizeof(buf) ? sizeof(buf) : remaining;
+    gsize got = 0;
+    if (!g_input_stream_read_all(input, buf, want, &got, NULL, NULL) || got == 0) {
+      close(fd);
+      unlink(tmp_path);
+      return FALSE;
+    }
+    gsize off = 0;
+    while (off < got) {
+      ssize_t n = write(fd, buf + off, got - off);
+      if (n < 0) {
+        if (errno == EINTR) continue;
+        close(fd);
+        unlink(tmp_path);
+        return FALSE;
+      }
+      off += (gsize) n;
+    }
+    remaining -= got;
+    if (out_written != NULL) *out_written += got;
+  }
+  if (close(fd) != 0) {
+    unlink(tmp_path);
+    return FALSE;
+  }
+  if (rename(tmp_path, dest_path) != 0) {
+    unlink(tmp_path);
+    return FALSE;
+  }
+  return TRUE;
+}
+
 static gchar *
 skm_build_files_json(const gchar *path)
 {
@@ -1630,8 +1987,16 @@ skm_build_files_json(const gchar *path)
   return g_string_free(json, FALSE);
 }
 
+/* Build the /api/health telemetry payload.
+ *
+ * @state is caller-owned and keeps the baselines CPU-total, per-core, and
+ * per-interface need so each WS subscriber sees its own deltas. The first
+ * call for a given state yields zeros for the deltas (no prior sample),
+ * subsequent calls yield real numbers. If @state is NULL we degrade to the
+ * process-global CPU baseline and report 0 for per-core/net deltas — that
+ * path is fine for one-shot REST calls where state ownership is awkward. */
 static gchar *
-skm_build_telemetry_json(SkmService *service)
+skm_build_telemetry_json(SkmService *service, SkmTelemetryState *state)
 {
   g_autofree gchar *uptime_path = NULL;
   g_autofree gchar *uptime_text = NULL;
@@ -1646,7 +2011,11 @@ skm_build_telemetry_json(SkmService *service)
   uptime_text = skm_read_uptime_text(uptime_path, &uptime_seconds);
   snapshot = skm_service_read_snapshot(service);
 
-  cpu_pct = skm_read_cpu_percent();
+  if (state != NULL) {
+    cpu_pct = skm_read_cpu_percent_local(&state->cpu_prev_total, &state->cpu_prev_idle);
+  } else {
+    cpu_pct = skm_read_cpu_percent();
+  }
   /* Previously this line did a pointer-cast type-pun — writing a gint
    * through a gdouble's storage — which works today by accident but UB
    * formally and breaks under -flto. Store into a real gint. */
@@ -1657,15 +2026,45 @@ skm_build_telemetry_json(SkmService *service)
   skm_read_meminfo(&mem_total, &mem_used, &mem_avail, &mem_cached, &mem_buffers, &mem_pct,
                    &swap_total, &swap_used);
 
+  /* Per-core CPU% against the caller's per-core baselines. When state is
+   * absent we still walk /proc/stat so @core_count (from /proc/cpuinfo) and
+   * the array length agree, but every entry will be 0.0 — acceptable for
+   * the stateless REST path. */
+  g_autoptr(GArray) per_core = g_array_new(FALSE, TRUE, sizeof(gdouble));
+  if (state != NULL) {
+    skm_read_cpu_per_core(state->cores, per_core);
+  }
+
   json = g_string_new("{");
   g_string_append_printf(json, "\"ts\":%.3f,", g_get_real_time() / 1000000.0);
 
   /* cpu block */
   g_string_append_printf(json,
-    "\"cpu\":{\"percent\":%.1f,\"per_core\":[%.1f],\"core_count\":%d,"
+    "\"cpu\":{\"percent\":%.1f,\"per_core\":[",
+    cpu_pct);
+  {
+    guint emitted = 0;
+    for (guint i = 0; i < per_core->len; i++) {
+      if (emitted > 0) g_string_append_c(json, ',');
+      g_string_append_printf(json, "%.1f", g_array_index(per_core, gdouble, i));
+      emitted++;
+    }
+    /* Fallback: no per-core state (REST path, or /proc/stat unavailable) —
+     * pad with @core_count copies of the aggregate so the iOS client's
+     * `per_core` row count still matches what it'd expect from the PS4's
+     * Jaguar APU. */
+    if (emitted == 0) {
+      for (gint i = 0; i < core_count; i++) {
+        if (i > 0) g_string_append_c(json, ',');
+        g_string_append_printf(json, "%.1f", cpu_pct);
+      }
+    }
+  }
+  g_string_append_printf(json,
+    "],\"core_count\":%d,"
     "\"freq_mhz\":%.0f,\"freq_max_mhz\":%.0f,"
     "\"load_1\":%.2f,\"load_5\":%.2f,\"load_15\":%.2f},",
-    cpu_pct, cpu_pct, (gint) cores,
+    (gint) cores,
     freq_mhz, freq_mhz,
     l1, l5, l15);
 
@@ -1690,19 +2089,32 @@ skm_build_telemetry_json(SkmService *service)
       snapshot->fan.has_temperature_c ? snapshot->fan.temperature_c : 0.0);
   }
 
-  /* net block — summarised per-interface bytes/s (snapshot, no delta) */
+  /* net block — real bytes/s against caller's per-interface baseline. */
   {
     GArray *ifaces = skm_read_net_dev();
+    gint64 now_us = g_get_monotonic_time();
     g_string_append(json, "\"net\":[");
     for (guint i = 0; i < ifaces->len; i++) {
       SkmNetIface *n = &g_array_index(ifaces, SkmNetIface, i);
       g_autofree gchar *esc = skm_json_escape(n->iface);
+      gdouble rx_ps = 0.0, tx_ps = 0.0;
+      if (state != NULL) {
+        SkmNetBaseline *b = skm_net_baseline_get(state->nets, n->iface);
+        if (b->prev_ts_us > 0 && now_us > b->prev_ts_us) {
+          gdouble dt = (now_us - b->prev_ts_us) / 1000000.0;
+          if (n->rx_bytes >= b->prev_rx) rx_ps = (n->rx_bytes - b->prev_rx) / dt;
+          if (n->tx_bytes >= b->prev_tx) tx_ps = (n->tx_bytes - b->prev_tx) / dt;
+        }
+        b->prev_rx    = n->rx_bytes;
+        b->prev_tx    = n->tx_bytes;
+        b->prev_ts_us = now_us;
+      }
       if (i > 0) g_string_append_c(json, ',');
-      /* bytes_sent_s / bytes_recv_s: report 0 (no inter-frame delta here) */
       g_string_append_printf(json,
-        "{\"iface\":\"%s\",\"bytes_sent_s\":0,\"bytes_recv_s\":0,"
+        "{\"iface\":\"%s\",\"bytes_sent_s\":%.0f,\"bytes_recv_s\":%.0f,"
+        "\"rx_total\":%" G_GUINT64_FORMAT ",\"tx_total\":%" G_GUINT64_FORMAT ","
         "\"packets_sent\":0,\"packets_recv\":0,\"errin\":0,\"errout\":0}",
-        esc);
+        esc, tx_ps, rx_ps, n->rx_bytes, n->tx_bytes);
     }
     g_string_append(json, "],");
     g_array_free(ifaces, TRUE);
@@ -1710,7 +2122,10 @@ skm_build_telemetry_json(SkmService *service)
 
   g_string_append(json, "\"disk\":[],");
   g_string_append_printf(json, "\"uptime_s\":%d,", uptime_seconds);
-  g_string_append(json, "\"tunnel\":{\"state\":\"stopped\",\"url\":null}");
+  {
+    g_autofree gchar *tun = skm_build_tunnel_status_json();
+    g_string_append_printf(json, "\"tunnel\":%s", tun);
+  }
   g_string_append(json, "}");
   skm_snapshot_free(snapshot);
   (void) uptime_text;
@@ -2043,14 +2458,22 @@ skm_handle_ws_telemetry(GSocketConnection *connection, GHashTable *headers)
   GOutputStream *output = g_io_stream_get_output_stream(G_IO_STREAM(connection));
   const gchar *key = g_hash_table_lookup(headers, "sec-websocket-key");
   SkmService *service = NULL;
-  /* Per-connection CPU baseline — previously every WS client shared the same
-   * g_cpu_prev_total/idle globals, so two subscribers caused oscillating
-   * percentages because each one consumed the other's delta. */
-  guint64 cpu_prev_total = 0, cpu_prev_idle = 0;
+  /* Per-connection telemetry state — CPU total, per-core, and per-interface
+   * net baselines all live here. Previously every WS client shared the same
+   * g_cpu_prev_total/idle globals, and per-core/net bytes were hardcoded to
+   * 0; this struct gives each subscriber its own delta window. */
+  SkmTelemetryState tstate = {
+    .cpu_prev_total = 0,
+    .cpu_prev_idle  = 0,
+    .cores = g_array_new(FALSE, TRUE, sizeof(SkmCpuCoreBaseline)),
+    .nets  = g_array_new(FALSE, TRUE, sizeof(SkmNetBaseline)),
+  };
   gint64 now_us = 0, last_send_us = 0, last_ping_us = 0;
   gint fd = -1;
 
   if (!skm_ws_send_handshake(output, key)) {
+    g_array_free(tstate.cores, TRUE);
+    g_array_free(tstate.nets, TRUE);
     return FALSE;
   }
 
@@ -2060,11 +2483,13 @@ skm_handle_ws_telemetry(GSocketConnection *connection, GHashTable *headers)
   for (;;) {
     now_us = g_get_monotonic_time();
 
-    /* Cadence: push a telemetry JSON every SKM_WS_TELEMETRY_INTERVAL_US. */
+    /* Cadence: push a telemetry JSON every SKM_WS_TELEMETRY_INTERVAL_US.
+     * skm_build_telemetry_json uses the caller-supplied state struct so
+     * each WS subscriber gets its own CPU / per-core / net deltas, instead
+     * of sharing the process-global baseline that made multi-client
+     * percentages oscillate. */
     if (now_us - last_send_us >= SKM_WS_TELEMETRY_INTERVAL_US) {
-      gdouble cpu_pct = skm_read_cpu_percent_local(&cpu_prev_total, &cpu_prev_idle);
-      (void) cpu_pct; /* skm_build_telemetry_json queries cpu itself for REST parity */
-      g_autofree gchar *payload = skm_build_telemetry_json(service);
+      g_autofree gchar *payload = skm_build_telemetry_json(service, &tstate);
       if (!skm_ws_write_text(output, payload)) {
         goto closed;
       }
@@ -2096,9 +2521,15 @@ skm_handle_ws_telemetry(GSocketConnection *connection, GHashTable *headers)
     gint opcode = skm_ws_drain_inbound_frame(input);
     if (opcode < 0) goto closed;
     if (opcode == 0x8) {
-      /* Close — echo it back so the client sees a clean shutdown. */
+      /* Close — echo it back so the client sees a clean shutdown, then
+       * return directly. Falling through to `closed:` would send a second
+       * close frame, which RFC 6455 §5.5.1 forbids ("a peer does not expect
+       * to receive any more data frames" after a close control frame). */
       skm_ws_write_frame(output, 0x8, NULL, 0);
-      goto closed;
+      skm_service_free(service);
+      g_array_free(tstate.cores, TRUE);
+      g_array_free(tstate.nets, TRUE);
+      return TRUE;
     }
     if (opcode == 0x9) {
       /* Ping — RFC 6455 requires a pong with the same payload; we send
@@ -2114,6 +2545,8 @@ closed:
    * gone already. */
   skm_ws_write_frame(output, 0x8, NULL, 0);
   skm_service_free(service);
+  g_array_free(tstate.cores, TRUE);
+  g_array_free(tstate.nets, TRUE);
   return TRUE;
 }
 
@@ -2477,16 +2910,55 @@ skm_handle_api_request(SkmRemoteServer *server,
     response = skm_build_files_json(query_path);
 
   } else if (g_strcmp0(path, "/api/files/download") == 0 && g_strcmp0(method, "GET") == 0) {
-    *out_status = 501;
-    response = skm_build_json_detail(501, "File download: use HTTP GET /api/files/download?path=...");
+    /* Handled pre-dispatch in skm_remote_server_run so the file can stream
+     * straight to the socket without being buffered into @response. If we
+     * reach this branch it means the pre-dispatch decided not to take it
+     * (e.g. unreachable in practice), so surface a clear 500. */
+    *out_status = 500;
+    response = skm_build_json_detail(500, "Download handler missed pre-dispatch.");
 
   } else if (g_strcmp0(path, "/api/files/upload") == 0 && g_strcmp0(method, "POST") == 0) {
-    *out_status = 501;
-    response = skm_build_json_detail(501, "File upload not yet implemented.");
+    /* Same story as download — upload is handled pre-dispatch to bypass
+     * the 64 KB body buffer. */
+    *out_status = 500;
+    response = skm_build_json_detail(500, "Upload handler missed pre-dispatch.");
 
   } else if (g_strcmp0(path, "/api/files/delete") == 0 && g_strcmp0(method, "DELETE") == 0) {
-    *out_status = 501;
-    response = skm_build_json_detail(501, "File delete not yet implemented.");
+    const gchar *target_path = g_hash_table_lookup(query, "path");
+    const gchar *reason = NULL;
+    g_autofree gchar *safe_path = skm_files_validate_path(target_path, &reason);
+    if (safe_path == NULL) {
+      *out_status = 400;
+      response = skm_build_json_detail(400, reason != NULL ? reason : "Path not allowed.");
+    } else {
+      GStatBuf st;
+      if (g_stat(safe_path, &st) != 0) {
+        *out_status = 404;
+        response = skm_build_json_detail(404, g_strerror(errno));
+      } else if (S_ISDIR(st.st_mode)) {
+        /* Recursive directory delete is a foot-gun for a remote UI — one
+         * swipe could wipe /home. Require the caller to send a follow-up
+         * request for each file, or to enable `recursive=1` explicitly. */
+        const gchar *recursive = g_hash_table_lookup(query, "recursive");
+        if (g_strcmp0(recursive, "1") != 0 && g_strcmp0(recursive, "true") != 0) {
+          *out_status = 409;
+          response = skm_build_json_detail(409,
+            "Target is a directory; pass ?recursive=1 to confirm.");
+        } else if (g_rmdir(safe_path) == 0) {
+          response = g_strdup_printf(
+            "{\"ok\":true,\"path\":\"%s\",\"kind\":\"dir\"}", safe_path);
+        } else {
+          *out_status = errno == ENOTEMPTY ? 409 : 500;
+          response = skm_build_json_detail(*out_status, g_strerror(errno));
+        }
+      } else if (g_unlink(safe_path) == 0) {
+        response = g_strdup_printf(
+          "{\"ok\":true,\"path\":\"%s\",\"kind\":\"file\"}", safe_path);
+      } else {
+        *out_status = errno == EACCES ? 403 : 500;
+        response = skm_build_json_detail(*out_status, g_strerror(errno));
+      }
+    }
 
   /* ── GPU level control (SKM-native) ──────────────────────────────────── */
   } else if (g_str_has_prefix(path, "/api/gpu/")) {
@@ -2592,18 +3064,6 @@ skm_remote_server_run(GThreadedSocketService *service,
   parts = NULL;
 
   headers = skm_read_headers(data_input, &content_length);
-  if (content_length > 65536) {
-    status = 400;
-    response_body = g_strdup("Request body too large.");
-    goto done;
-  }
-
-  if (content_length > 0) {
-    /* Keep reading from the buffered data stream.
-     * Switching back to raw socket stream can block if body bytes were
-     * already prefetched while parsing headers. */
-    body = skm_read_body(G_INPUT_STREAM(data_input), content_length);
-  }
 
   path = g_strdup(target);
   if (path != NULL) {
@@ -2616,6 +3076,92 @@ skm_remote_server_run(GThreadedSocketService *service,
   }
   skm_normalize_path(path);
   query = skm_parse_form(query_text);
+
+  /* ── File upload / download pre-dispatch ─────────────────────────────────
+   * These two endpoints need streaming I/O: the 64 KB body ceiling and the
+   * skm_build_json_detail response path are both the wrong shape for
+   * multi-MB file transfers. Handle them here, before the size cap is
+   * enforced on normal requests, and bypass skm_write_response() so we can
+   * stream chunks straight to the socket. */
+  if (g_strcmp0(path, "/api/files/download") == 0 && g_strcmp0(method, "GET") == 0) {
+    if (!skm_remote_auth_check(server, headers)) {
+      skm_write_response(output, 401, "application/json; charset=utf-8",
+                         skm_build_json_detail(401, "Invalid or missing token."));
+      g_io_stream_close(G_IO_STREAM(connection), NULL, NULL);
+      return TRUE;
+    }
+    const gchar *target_path = g_hash_table_lookup(query, "path");
+    const gchar *reason = NULL;
+    g_autofree gchar *safe_path = skm_files_validate_path(target_path, &reason);
+    if (safe_path == NULL) {
+      skm_write_response(output, 400, "application/json; charset=utf-8",
+                         skm_build_json_detail(400, reason != NULL ? reason : "Path not allowed."));
+    } else if (!skm_stream_file_response(output, safe_path)) {
+      skm_write_response(output, 500, "application/json; charset=utf-8",
+                         skm_build_json_detail(500, g_strerror(errno)));
+    }
+    g_io_stream_close(G_IO_STREAM(connection), NULL, NULL);
+    return TRUE;
+  }
+
+  if (g_strcmp0(path, "/api/files/upload") == 0 && g_strcmp0(method, "POST") == 0) {
+    /* Cap upload size at 128 MiB. Anything larger should be pushed over
+     * SCP / the PS4's usual transfer path; the daemon's job is convenience,
+     * not bulk-data serving. */
+    const gsize upload_max = (gsize) 128 * 1024 * 1024;
+    if (!skm_remote_auth_check(server, headers)) {
+      skm_write_response(output, 401, "application/json; charset=utf-8",
+                         skm_build_json_detail(401, "Invalid or missing token."));
+      g_io_stream_close(G_IO_STREAM(connection), NULL, NULL);
+      return TRUE;
+    }
+    if (content_length == 0) {
+      skm_write_response(output, 411, "application/json; charset=utf-8",
+                         skm_build_json_detail(411, "Content-Length required for upload."));
+      g_io_stream_close(G_IO_STREAM(connection), NULL, NULL);
+      return TRUE;
+    }
+    if (content_length > upload_max) {
+      skm_write_response(output, 413, "application/json; charset=utf-8",
+                         skm_build_json_detail(413, "Upload exceeds 128 MiB limit."));
+      g_io_stream_close(G_IO_STREAM(connection), NULL, NULL);
+      return TRUE;
+    }
+    const gchar *target_path = g_hash_table_lookup(query, "path");
+    const gchar *reason = NULL;
+    g_autofree gchar *safe_path = skm_files_validate_upload_target(target_path, &reason);
+    if (safe_path == NULL) {
+      skm_write_response(output, 400, "application/json; charset=utf-8",
+                         skm_build_json_detail(400, reason != NULL ? reason : "Path not allowed."));
+      g_io_stream_close(G_IO_STREAM(connection), NULL, NULL);
+      return TRUE;
+    }
+    gsize written = 0;
+    if (!skm_stream_upload_to_file(G_INPUT_STREAM(data_input), safe_path, content_length, &written)) {
+      skm_write_response(output, 500, "application/json; charset=utf-8",
+                         skm_build_json_detail(500, g_strerror(errno)));
+    } else {
+      g_autofree gchar *resp = g_strdup_printf(
+        "{\"ok\":true,\"path\":\"%s\",\"bytes\":%" G_GSIZE_FORMAT "}",
+        safe_path, written);
+      skm_write_response(output, 200, "application/json; charset=utf-8", resp);
+    }
+    g_io_stream_close(G_IO_STREAM(connection), NULL, NULL);
+    return TRUE;
+  }
+
+  if (content_length > 65536) {
+    status = 400;
+    response_body = g_strdup("Request body too large.");
+    goto done;
+  }
+
+  if (content_length > 0) {
+    /* Keep reading from the buffered data stream.
+     * Switching back to raw socket stream can block if body bytes were
+     * already prefetched while parsing headers. */
+    body = skm_read_body(G_INPUT_STREAM(data_input), content_length);
+  }
   peer = skm_remote_identify_peer(connection);
   skm_remote_record_client(server, peer, method, path, g_hash_table_lookup(headers, "user-agent"));
 
@@ -2943,7 +3489,12 @@ skm_remote_run_headless(const SkmAppSettings *settings, gint port_override)
     return 1;
   }
 
-  g_print("Strawberry Kernel Manager remote listening on http://0.0.0.0:%d\n", port);
+  /* The bind address mirrors the auth state: with a password set we listen
+   * on every interface, without a password we listen on loopback only (see
+   * skm_remote_server_start). Print whichever actually applies so the user
+   * isn't surprised when iOS can't reach the daemon from the LAN. */
+  g_print("Strawberry Kernel Manager remote listening on http://%s:%d\n",
+          server->auth_required ? "0.0.0.0" : "127.0.0.1", port);
   g_print("Strawberry Manager API + telemetry WS + PTY terminal: same host/port\n");
   if (server->auth_required)
     g_print("Auth: password required (HMAC-SHA256 token).\n");
