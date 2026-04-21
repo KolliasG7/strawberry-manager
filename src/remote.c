@@ -310,8 +310,10 @@ skm_read_cpu_per_core(GArray *cores, GArray *out)
   g_array_set_size(out, 0);
   if (f == NULL) return;
   while (fgets(line, sizeof(line), f)) {
-    guint n;
-    guint64 user, nice, system, idle, iowait, irq, softirq, steal;
+    guint n = 0;
+    /* Zero-init so optional fields (iowait/irq/softirq/steal) don't carry
+     * garbage when fscanf returns 5–8 instead of 9. */
+    guint64 user = 0, nice = 0, system = 0, idle = 0, iowait = 0, irq = 0, softirq = 0, steal = 0;
     if (sscanf(line,
          "cpu%u %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT
          " %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT
@@ -610,7 +612,9 @@ skm_read_processes(gint limit, const gchar *sort_by)
   {
     FILE *sf = fopen("/proc/stat", "r");
     if (sf != NULL) {
-      guint64 u, n, s, id, iw, ir, sir, st;
+      /* Zero-init so a short fscanf (older kernels lack iowait/irq/softirq/
+       * steal) can't contribute indeterminate bits to the total. */
+      guint64 u = 0, n = 0, s = 0, id = 0, iw = 0, ir = 0, sir = 0, st = 0;
       if (fscanf(sf,
            "cpu %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT
            " %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT
@@ -655,7 +659,8 @@ skm_read_processes(gint limit, const gchar *sort_by)
   {
     FILE *sf = fopen("/proc/stat", "r");
     if (sf != NULL) {
-      guint64 u, n, s, id, iw, ir, sir, st;
+      /* Zero-init mirrors the T0 block above — same fscanf-short hazard. */
+      guint64 u = 0, n = 0, s = 0, id = 0, iw = 0, ir = 0, sir = 0, st = 0;
       if (fscanf(sf,
            "cpu %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT
            " %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT " %" G_GUINT64_FORMAT
@@ -1860,6 +1865,15 @@ skm_stream_file_response(GOutputStream *output, const gchar *safe_path)
     return FALSE;
   }
   g_autofree gchar *base = g_path_get_basename(safe_path);
+  /* Linux filenames can contain ", \, CR, LF and other bytes that would
+   * break the Content-Disposition header value. Sanitize in place — any
+   * non-printable ASCII or structural character becomes '_'. Clients that
+   * care about the exact filename can reconstruct it from the path query
+   * param; this header is only a download convenience. */
+  for (gchar *p = base; *p != '\0'; p++) {
+    guchar c = (guchar) *p;
+    if (c < 0x20 || c == 0x7f || c == '"' || c == '\\') *p = '_';
+  }
   g_autofree gchar *header = g_strdup_printf(
     "HTTP/1.1 200 OK\r\n"
     "Content-Type: application/octet-stream\r\n"
@@ -2945,15 +2959,19 @@ skm_handle_api_request(SkmRemoteServer *server,
           response = skm_build_json_detail(409,
             "Target is a directory; pass ?recursive=1 to confirm.");
         } else if (g_rmdir(safe_path) == 0) {
+          /* Escape safe_path — Linux filenames can contain " and \, which
+           * would produce malformed JSON without this pass. */
+          g_autofree gchar *escaped = skm_json_escape(safe_path);
           response = g_strdup_printf(
-            "{\"ok\":true,\"path\":\"%s\",\"kind\":\"dir\"}", safe_path);
+            "{\"ok\":true,\"path\":\"%s\",\"kind\":\"dir\"}", escaped);
         } else {
           *out_status = errno == ENOTEMPTY ? 409 : 500;
           response = skm_build_json_detail(*out_status, g_strerror(errno));
         }
       } else if (g_unlink(safe_path) == 0) {
+        g_autofree gchar *escaped = skm_json_escape(safe_path);
         response = g_strdup_printf(
-          "{\"ok\":true,\"path\":\"%s\",\"kind\":\"file\"}", safe_path);
+          "{\"ok\":true,\"path\":\"%s\",\"kind\":\"file\"}", escaped);
       } else {
         *out_status = errno == EACCES ? 403 : 500;
         response = skm_build_json_detail(*out_status, g_strerror(errno));
@@ -3141,9 +3159,10 @@ skm_remote_server_run(GThreadedSocketService *service,
       skm_write_response(output, 500, "application/json; charset=utf-8",
                          skm_build_json_detail(500, g_strerror(errno)));
     } else {
+      g_autofree gchar *escaped = skm_json_escape(safe_path);
       g_autofree gchar *resp = g_strdup_printf(
         "{\"ok\":true,\"path\":\"%s\",\"bytes\":%" G_GSIZE_FORMAT "}",
-        safe_path, written);
+        escaped, written);
       skm_write_response(output, 200, "application/json; charset=utf-8", resp);
     }
     g_io_stream_close(G_IO_STREAM(connection), NULL, NULL);
