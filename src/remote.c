@@ -2848,10 +2848,29 @@ skm_handle_api_request(SkmRemoteServer *server,
         save_error != NULL ? save_error->message : "Failed to persist new password.");
     }
 
-    /* Disk write succeeded — commit to memory. set_password() also
-     * clears the old auth_token so any in-flight request using the
-     * previous token is rejected on its next call. */
-    skm_remote_server_set_password(server, next);
+    /* Disk write succeeded — commit to memory using the SAME salt+hash
+     * we just persisted. We deliberately do NOT call
+     * skm_remote_server_set_password() here: that helper generates a
+     * fresh random salt and derives a second hash, which would leave
+     * server->settings (and server->auth_token) holding values that
+     * disagree with what was just written to disk. After a daemon
+     * restart the on-disk hash would become authoritative and the
+     * token we return to the client below would suddenly stop working.
+     * A later skm_settings_save() could also silently overwrite the
+     * good on-disk hash with the stale in-memory one.
+     *
+     * Instead, mirror what skm_remote_server_new() does on load: adopt
+     * the persisted hash verbatim and publish it as the bearer token.
+     * Clearing server->auth_token first also invalidates any in-flight
+     * request still using the old token. */
+    g_clear_pointer(&server->auth_token, g_free);
+    g_clear_pointer(&server->settings.remote_password, g_free);
+    g_clear_pointer(&server->settings.remote_hmac_salt, g_free);
+    g_clear_pointer(&server->settings.remote_password_hash, g_free);
+    server->settings.remote_hmac_salt     = g_strdup(new_salt);
+    server->settings.remote_password_hash = g_strdup(new_hash);
+    server->auth_token   = g_strdup(new_hash);
+    server->auth_required = TRUE;
     skm_app_settings_clear(&updated);
 
     return g_strdup_printf("{\"ok\":true,\"token\":\"%s\",\"auth_required\":true}",
