@@ -2770,6 +2770,94 @@ skm_handle_api_request(SkmRemoteServer *server,
     }
   }
 
+  /* ── /auth/change-password ───────────────────────────────────────────── */
+  /* Requires a valid Bearer token (enforced by the guard above) AND
+   * knowledge of the current password. The two checks together mean a
+   * leaked token alone can't rotate the password — the attacker would
+   * also need the plaintext — and a stale password-guess attempt can't
+   * rotate without first logging in. */
+  if (g_strcmp0(path, "/auth/change-password") == 0 && g_strcmp0(method, "POST") == 0) {
+    if (!server->auth_required) {
+      *out_status = 400;
+      return skm_build_json_detail(400,
+        "No password is currently set. Configure remote_password via settings first.");
+    }
+    if (server->settings_path == NULL) {
+      *out_status = 500;
+      return skm_build_json_detail(500, "Settings path unavailable; cannot persist rotation.");
+    }
+
+    const gchar *current = g_hash_table_lookup(values, "current_password");
+    const gchar *next    = g_hash_table_lookup(values, "new_password");
+    if (current == NULL || *current == '\0' || next == NULL || *next == '\0') {
+      *out_status = 400;
+      return skm_build_json_detail(400,
+        "Both current_password and new_password are required and must be non-empty.");
+    }
+    if (strlen(next) < 4) {
+      *out_status = 400;
+      return skm_build_json_detail(400, "New password must be at least 4 characters.");
+    }
+    if (g_strcmp0(current, next) == 0) {
+      *out_status = 400;
+      return skm_build_json_detail(400, "New password must differ from the current one.");
+    }
+
+    /* Verify current password matches stored hash, with the same
+     * rate-limit + jitter-sleep as /auth/login so this endpoint can't
+     * be used to bypass the login throttle. */
+    if (skm_login_is_locked(server, peer_ip)) {
+      *out_status = 429;
+      return skm_build_json_detail(429, "Too many failed attempts. Try again later.");
+    }
+    g_autofree gchar *current_hash = (server->settings.remote_hmac_salt != NULL)
+      ? skm_hmac_sha256_hex(current, server->settings.remote_hmac_salt)
+      : NULL;
+    if (current_hash == NULL || !skm_token_equal(current_hash, server->auth_token)) {
+      skm_login_record_failure(server, peer_ip);
+      g_usleep(SKM_LOGIN_FAIL_SLEEP_US);
+      *out_status = 401;
+      return skm_build_json_detail(401, "Current password is incorrect.");
+    }
+    skm_login_record_success(server, peer_ip);
+
+    /* Rotate: new salt + hash, persist, then publish the new token.
+     * set_password() mutates server->settings in place; we save first
+     * using a staged copy so a disk failure doesn't leave the daemon
+     * with an unpersisted hash that no settings.ini row matches. */
+    g_autofree gchar *new_salt = skm_generate_hmac_salt();
+    g_autofree gchar *new_hash = skm_hmac_sha256_hex(next, new_salt);
+    if (new_salt == NULL || new_hash == NULL) {
+      *out_status = 500;
+      return skm_build_json_detail(500, "Failed to derive new password hash.");
+    }
+
+    SkmAppSettings updated = { 0 };
+    skm_app_settings_assign(&updated, &server->settings);
+    g_clear_pointer(&updated.remote_password, g_free);       /* no plaintext on disk */
+    g_clear_pointer(&updated.remote_hmac_salt, g_free);
+    g_clear_pointer(&updated.remote_password_hash, g_free);
+    updated.remote_hmac_salt = g_strdup(new_salt);
+    updated.remote_password_hash = g_strdup(new_hash);
+
+    g_autoptr(GError) save_error = NULL;
+    if (!skm_settings_save(&updated, server->settings_path, &save_error)) {
+      skm_app_settings_clear(&updated);
+      *out_status = 500;
+      return skm_build_json_detail(500,
+        save_error != NULL ? save_error->message : "Failed to persist new password.");
+    }
+
+    /* Disk write succeeded — commit to memory. set_password() also
+     * clears the old auth_token so any in-flight request using the
+     * previous token is rejected on its next call. */
+    skm_remote_server_set_password(server, next);
+    skm_app_settings_clear(&updated);
+
+    return g_strdup_printf("{\"ok\":true,\"token\":\"%s\",\"auth_required\":true}",
+                           server->auth_token);
+  }
+
   if (g_strcmp0(path, "/api/settings") == 0) {
     if (g_strcmp0(method, "GET") == 0) {
       return skm_build_settings_json(server);
