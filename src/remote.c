@@ -1675,6 +1675,119 @@ skm_build_tunnel_status_json(void)
   return g_strdup_printf("{\"state\":\"%s\",\"url\":null}", state);
 }
 
+/* Tail the systemd journal for the strawberry-manager unit and return a
+ * JSON envelope:
+ *
+ *   { "unit": "strawberry-manager", "lines": [ "...", "..." ],
+ *     "count": N, "priority": <0-7>|null }
+ *
+ * Parameters:
+ *   lines    — number of most-recent lines to return (1..2000). The caller
+ *              is expected to have clamped but we re-clamp defensively so
+ *              a bug in the dispatch layer can't explode into an OOM.
+ *   priority — NULL or a single digit 0..7 (journald syslog priority).
+ *              Already validated by the caller; rejected here too as a
+ *              defence in depth.
+ *   out_status — on failure, set to the HTTP status code (400/500) the
+ *                caller should return alongside the body.
+ *
+ * Spawns `journalctl -u strawberry-manager -n N --no-pager
+ * --output=short-iso [-p P]` with an explicit argv (no shell), so there
+ * is no injection surface even if upstream validation ever regresses.
+ *
+ * Returns a heap-allocated JSON string on success, or a
+ * skm_build_json_detail() error body if journalctl is unavailable, times
+ * out, or exits non-zero. */
+static gchar *
+skm_build_logs_json(gint lines, const gchar *priority, gint *out_status)
+{
+  if (lines < 1) lines = 1;
+  if (lines > 2000) lines = 2000;
+
+  const gchar *prio = NULL;
+  if (priority != NULL && priority[0] != '\0') {
+    if (priority[1] == '\0' && priority[0] >= '0' && priority[0] <= '7') {
+      prio = priority;
+    } else {
+      if (out_status != NULL) *out_status = 400;
+      return skm_build_json_detail(400,
+        "priority must be a single digit 0-7 (journald syslog priority).");
+    }
+  }
+
+  g_autofree gchar *lines_str = g_strdup_printf("%d", lines);
+
+  /* Explicit argv, no shell. Every slot is either a literal or one of the
+   * two values we just validated, so g_spawn_sync() cannot be tricked into
+   * running anything else via argument smuggling. */
+  const gchar *argv[12] = { 0 };
+  gsize i = 0;
+  argv[i++] = "journalctl";
+  argv[i++] = "-u";
+  argv[i++] = "strawberry-manager";
+  argv[i++] = "-n";
+  argv[i++] = lines_str;
+  argv[i++] = "--no-pager";
+  argv[i++] = "--output=short-iso";
+  if (prio != NULL) {
+    argv[i++] = "-p";
+    argv[i++] = prio;
+  }
+  argv[i] = NULL;
+
+  g_autofree gchar *stdout_buf = NULL;
+  g_autofree gchar *stderr_buf = NULL;
+  gint exit_status = 0;
+  g_autoptr(GError) spawn_error = NULL;
+  gboolean ok = g_spawn_sync(
+    NULL,                            /* working directory: inherit */
+    (gchar **) argv,
+    NULL,                            /* env: inherit */
+    G_SPAWN_SEARCH_PATH,
+    NULL, NULL,                      /* no setup fn */
+    &stdout_buf, &stderr_buf,
+    &exit_status,
+    &spawn_error);
+
+  if (!ok) {
+    if (out_status != NULL) *out_status = 500;
+    return skm_build_json_detail(500,
+      spawn_error != NULL && spawn_error->message != NULL
+        ? spawn_error->message
+        : "Failed to spawn journalctl.");
+  }
+  if (!g_spawn_check_wait_status(exit_status, NULL)) {
+    if (out_status != NULL) *out_status = 500;
+    g_autofree gchar *trimmed = (stderr_buf != NULL && *stderr_buf != '\0')
+      ? g_strdup(g_strchomp(stderr_buf))
+      : g_strdup("journalctl exited non-zero.");
+    return skm_build_json_detail(500, trimmed);
+  }
+
+  GString *json = g_string_new("{\"unit\":\"strawberry-manager\",\"lines\":[");
+  gsize count = 0;
+  if (stdout_buf != NULL) {
+    gchar **arr = g_strsplit(stdout_buf, "\n", -1);
+    for (gchar **p = arr; *p != NULL; p++) {
+      /* journalctl's output includes a trailing empty line from the
+       * final newline; skip any empties so the JSON array is tight. */
+      if (**p == '\0') continue;
+      g_autofree gchar *esc = skm_json_escape(*p);
+      if (count > 0) g_string_append_c(json, ',');
+      g_string_append_printf(json, "\"%s\"", esc);
+      count++;
+    }
+    g_strfreev(arr);
+  }
+  g_string_append_printf(json,
+    "],\"count\":%" G_GSIZE_FORMAT ",\"priority\":%s%s%s}",
+    count,
+    prio != NULL ? "\"" : "null",
+    prio != NULL ? prio : "",
+    prio != NULL ? "\"" : "");
+  return g_string_free(json, FALSE);
+}
+
 static gchar *
 skm_build_processes_json(gint limit, const gchar *sort_by)
 {
@@ -3000,6 +3113,16 @@ skm_handle_api_request(SkmRemoteServer *server,
         response = skm_build_json_detail(*out_status, g_strerror(errno));
       }
     }
+
+  /* ── System journal ──────────────────────────────────────────────────── */
+  } else if (g_strcmp0(path, "/api/system/logs") == 0 && g_strcmp0(method, "GET") == 0) {
+    const gchar *lines_str = g_hash_table_lookup(query, "lines");
+    const gchar *priority  = g_hash_table_lookup(query, "priority");
+    /* Default is 500 — enough to tell "what's happening right now" on a
+     * crash without producing a multi-MB body on every open. 2000 is the
+     * hard ceiling enforced inside skm_build_logs_json. */
+    gint lines = lines_str != NULL ? atoi(lines_str) : 500;
+    response = skm_build_logs_json(lines, priority, out_status);
 
   /* ── Power ───────────────────────────────────────────────────────────── */
   } else if (g_str_has_prefix(path, "/api/power/") && g_strcmp0(method, "POST") == 0) {
