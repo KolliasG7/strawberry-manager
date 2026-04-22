@@ -3059,6 +3059,7 @@ skm_remote_server_run(GThreadedSocketService *service,
   g_autofree gchar *body = NULL;
   g_autofree gchar *response_body = NULL;
   g_autofree gchar *peer = NULL;
+  g_autofree gchar *peer_ip = NULL;
   g_autofree gchar *notice_message = NULL;
   g_autoptr(GHashTable) headers = NULL;
   g_autoptr(GHashTable) query = NULL;
@@ -3247,7 +3248,13 @@ skm_remote_server_run(GThreadedSocketService *service,
   }
 
   values = skm_values_from_json_or_form(g_hash_table_lookup(headers, "content-type"), body);
-  g_autofree gchar *peer_ip = skm_remote_peer_ip(peer);
+  /* peer_ip is declared at the top of the function (not here) because several
+   * earlier `goto done` edges — including the `GET /` short-circuit — skip
+   * past this point. Leaving the declaration here meant g_autofree's cleanup
+   * attribute fired on an uninitialized stack slot, which showed up as
+   * `free(): invalid size` on -O2 release builds (ASan's -O0 zero-init
+   * happened to mask it). */
+  peer_ip = skm_remote_peer_ip(peer);
   response_body = skm_handle_api_request(
     server,
     method,
