@@ -161,7 +161,7 @@ meson compile -C builddir
 ### Headless Remote Mode
 
 ```bash
-./builddir/strawberry-kernel-manager --headless --port 8080
+./builddir/strawberry-kernel-manager --headless --port 8000
 ```
 
 Exposes the Strawberry Manager REST API, WebSocket telemetry, and PTY terminal on the specified port. Connect with the mobile app in [`braska/`](./braska). No browser UI is served.
