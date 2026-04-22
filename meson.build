@@ -30,6 +30,7 @@ sources = files(
   'src/service-gpu.c',
   'src/settings.c',
   'src/remote.c',
+  'src/remote-util.c',
   'src/sysfs.c',
 )
 
@@ -40,6 +41,20 @@ executable(
   dependencies: [gtk_dep, gio_dep, glib_dep, m_dep],
   install: true,
 )
+
+# ── Unit tests ─────────────────────────────────────────────────────────
+# Pure-helper coverage. Each test binary links only the translation units
+# it actually exercises (no GTK, no full REST server), so `meson test` is
+# cheap enough to run on every commit without booting the daemon.
+test_remote_util = executable(
+  'test-remote-util',
+  ['tests/test_remote_util.c', 'src/remote-util.c'],
+  include_directories: include_directories('src'),
+  dependencies: [glib_dep],
+  build_by_default: false,
+  install: false,
+)
+test('remote-util', test_remote_util)
 
 install_data(
   'data/theme.css',

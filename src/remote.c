@@ -2,6 +2,7 @@
 
 #include "skm-remote.h"
 
+#include "skm-remote-util.h"
 #include "skm-service-private.h"
 #include "skm-sysfs.h"
 
@@ -938,42 +939,8 @@ skm_remote_emit_notice(SkmRemoteServer *server, gboolean success, gboolean refre
 }
 
 
-static gchar *
-skm_json_escape(const gchar *text)
-{
-  GString *escaped = NULL;
-  const gchar *cursor = NULL;
-
-  if (text == NULL) {
-    return g_strdup("");
-  }
-
-  escaped = g_string_new("");
-  for (cursor = text; *cursor != '\0'; cursor++) {
-    switch (*cursor) {
-      case '\\':
-        g_string_append(escaped, "\\\\");
-        break;
-      case '"':
-        g_string_append(escaped, "\\\"");
-        break;
-      case '\n':
-        g_string_append(escaped, "\\n");
-        break;
-      case '\r':
-        g_string_append(escaped, "\\r");
-        break;
-      case '\t':
-        g_string_append(escaped, "\\t");
-        break;
-      default:
-        g_string_append_c(escaped, *cursor);
-        break;
-    }
-  }
-
-  return g_string_free(escaped, FALSE);
-}
+/* skm_json_escape moved to remote-util.c so it's reachable from the
+ * meson test harness. Declaration comes in via skm-remote-util.h. */
 
 
 static gint
