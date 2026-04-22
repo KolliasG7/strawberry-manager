@@ -3204,15 +3204,35 @@ skm_remote_server_run(GThreadedSocketService *service,
   skm_remote_record_client(server, peer, method, path, g_hash_table_lookup(headers, "user-agent"));
 
   if (skm_is_websocket_request(headers)) {
-    /* For WS, mobile app passes ?token=<hex> in query string.
-     * Inject it as a synthetic "token" header so the auth guard finds it. */
+    /* Modern clients send "Authorization: Bearer <token>" on the WS
+     * upgrade request. Legacy clients (pre-iOS-PR#15) pass the token
+     * via ?token=<hex> in the query string — audit finding C7 — which
+     * leaks the token into every access log on the path. Accept both
+     * but warn once per connection when only the legacy path is used,
+     * so deployers can spot stragglers before the fallback is removed. */
     const gchar *qs_token = g_hash_table_lookup(query, "token");
-    if (qs_token != NULL)
-      g_hash_table_replace(headers, g_strdup("token"), g_strdup(qs_token));
+    const gchar *auth_hdr = g_hash_table_lookup(headers, "authorization");
+    const gboolean has_bearer =
+      auth_hdr != NULL && g_str_has_prefix(auth_hdr, "Bearer ");
 
-    /* Auth guard for WS endpoints */
+    if (qs_token != NULL && !has_bearer) {
+      g_warning(
+        "deprecated WS auth via ?token= query string from %s (path %s); "
+        "client should send \"Authorization: Bearer <token>\" on the "
+        "upgrade request instead (audit C7).",
+        peer != NULL ? peer : "?", path);
+    }
+
+    /* Auth guard for WS endpoints — mirror the REST guard precedence:
+     * Authorization: Bearer wins; fall back to ?token= query string for
+     * legacy clients. */
     if (server->auth_required) {
-      const gchar *bearer = g_hash_table_lookup(headers, "token");
+      const gchar *bearer = NULL;
+      if (has_bearer) {
+        bearer = auth_hdr + 7;
+      } else if (qs_token != NULL) {
+        bearer = qs_token;
+      }
       if (bearer == NULL || !skm_token_equal(bearer, server->auth_token)) {
         skm_write_response(output, 401, "application/json; charset=utf-8",
                            skm_build_json_detail(401, "Unauthorized"));
