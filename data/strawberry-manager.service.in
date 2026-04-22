@@ -1,0 +1,38 @@
+[Unit]
+Description=Strawberry Kernel Manager (headless remote API)
+Documentation=https://github.com/KolliasG7/strawberry-manager
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Port is defined here as a drop-in-overridable environment variable.
+# Override by dropping a file into
+#   /etc/systemd/system/strawberry-manager.service.d/override.conf
+# with:
+#   [Service]
+#   Environment=SKM_PORT=9000
+# then `systemctl daemon-reload && systemctl restart strawberry-manager`.
+Environment=SKM_PORT=8000
+ExecStart=@bindir@/strawberry-kernel-manager --headless --port ${SKM_PORT}
+
+# Daemon genuinely needs root: it calls reboot()/sync() for power actions,
+# reads /root/.config/strawberry-kernel-manager/settings.ini when run as
+# root (which matches the documented setup path), spawns PTY shells, and
+# writes sysfs nodes that sit outside the udev group-write rules.
+User=root
+
+# Conservative hardening. Everything stricter than this (ProtectSystem,
+# NoNewPrivileges, CAP_*) breaks one of sysfs writes / reboot / bash PTYs
+# in practice, so keep the sandbox light.
+PrivateTmp=true
+
+Restart=on-failure
+RestartSec=3s
+# Give the process a chance to flush its HTTP response before systemd
+# kills it on stop — matches the in-daemon "defer reboot until response
+# flushed" pattern from PR #2.
+TimeoutStopSec=10s
+
+[Install]
+WantedBy=multi-user.target

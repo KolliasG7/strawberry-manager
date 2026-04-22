@@ -172,6 +172,41 @@ Exposes the Strawberry Manager REST API, WebSocket telemetry, and PTY terminal o
 meson install -C builddir
 ```
 
+This installs the binary, the theme assets, and a systemd unit
+(`strawberry-manager.service`) into the distro's system unit directory.
+The unit's install dir is picked up from `pkg-config --variable=systemdsystemunitdir systemd`
+(override with `meson setup builddir -Dsystemdsystemunitdir=/path/to/dir` if
+you want it elsewhere, or install to a staging root with `DESTDIR=`).
+
+### Run as a Background Service (systemd)
+
+After `meson install -C builddir`, the daemon can be managed like any
+other service:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now strawberry-manager
+sudo systemctl status strawberry-manager
+journalctl -u strawberry-manager -f          # live log stream
+```
+
+It listens on port 8000 by default. To change the port, drop in an
+override instead of editing the packaged unit:
+
+```bash
+sudo systemctl edit strawberry-manager
+# paste:
+# [Service]
+# Environment=SKM_PORT=9000
+sudo systemctl restart strawberry-manager
+```
+
+The service runs as `root` so it can call `reboot()`, write sysfs nodes
+outside the `video` group allowlist, and read
+`/root/.config/strawberry-kernel-manager/settings.ini` — set your
+`remote_password` there before starting the service (see the Remote API
+section above).
+
 ### Direct Compile
 
 If you want quick local build without Meson:

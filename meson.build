@@ -46,3 +46,27 @@ install_data(
   'data/strawberry-logo.svg',
   install_dir: join_paths(get_option('datadir'), meson.project_name()),
 )
+
+# systemd unit for the headless remote daemon. ExecStart is resolved
+# against the install prefix's bindir so distro packagers don't have to
+# patch the template.
+systemd_unit_dir = get_option('systemdsystemunitdir')
+if systemd_unit_dir == ''
+  systemd_dep = dependency('systemd', required: false)
+  if systemd_dep.found()
+    systemd_unit_dir = systemd_dep.get_variable(pkgconfig: 'systemdsystemunitdir')
+  else
+    systemd_unit_dir = join_paths(get_option('prefix'), 'lib/systemd/system')
+  endif
+endif
+
+service_conf = configuration_data()
+service_conf.set('bindir', join_paths(get_option('prefix'), get_option('bindir')))
+
+configure_file(
+  input: 'data/strawberry-manager.service.in',
+  output: 'strawberry-manager.service',
+  configuration: service_conf,
+  install: true,
+  install_dir: systemd_unit_dir,
+)
