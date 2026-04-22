@@ -1,0 +1,11 @@
+# Strawberry Kernel Manager
+# Grant video group write access to PS4 Strawberry control nodes.
+
+ACTION=="add", SUBSYSTEM=="hwmon", ATTR{name}=="ps4_fan", RUN+="/bin/sh -c 'for n in /sys%p/pwm1 /sys%p/pwm1_enable /sys%p/fan_threshold; do [ -e \"$n\" ] && chgrp video \"$n\" && chmod g+w \"$n\"; done'"
+ACTION=="change", SUBSYSTEM=="hwmon", ATTR{name}=="ps4_fan", RUN+="/bin/sh -c 'for n in /sys%p/pwm1 /sys%p/pwm1_enable /sys%p/fan_threshold; do [ -e \"$n\" ] && chgrp video \"$n\" && chmod g+w \"$n\"; done'"
+
+ACTION=="add", SUBSYSTEM=="leds", KERNEL=="ps4:*", RUN+="/bin/sh -c 'for n in /sys%p/brightness /sys%p/trigger /sys%p/thermal_mode; do [ -e \"$n\" ] && chgrp video \"$n\" && chmod g+w \"$n\"; done'"
+ACTION=="change", SUBSYSTEM=="leds", KERNEL=="ps4:*", RUN+="/bin/sh -c 'for n in /sys%p/brightness /sys%p/trigger /sys%p/thermal_mode; do [ -e \"$n\" ] && chgrp video \"$n\" && chmod g+w \"$n\"; done'"
+
+ACTION=="add", SUBSYSTEM=="drm", KERNEL=="card0", RUN+="/bin/sh -c 'for n in /sys/class/drm/card0/device/power_dpm_force_performance_level /sys/class/drm/card0/device/pp_dpm_sclk /sys/class/drm/card0-*/status; do [ -e \"$n\" ] && chgrp video \"$n\" && chmod g+w \"$n\"; done'"
+ACTION=="change", SUBSYSTEM=="drm", KERNEL=="card0", RUN+="/bin/sh -c 'for n in /sys/class/drm/card0/device/power_dpm_force_performance_level /sys/class/drm/card0/device/pp_dpm_sclk /sys/class/drm/card0-*/status; do [ -e \"$n\" ] && chgrp video \"$n\" && chmod g+w \"$n\"; done'"

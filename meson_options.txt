@@ -1,0 +1,6 @@
+option(
+  'systemdsystemunitdir',
+  type: 'string',
+  value: '',
+  description: 'Directory for systemd system unit files (empty = autodetect from pkg-config, fallback to $prefix/lib/systemd/system)',
+)
