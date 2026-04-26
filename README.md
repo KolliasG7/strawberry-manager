@@ -56,7 +56,7 @@ The application is also deliberately defensive:
 - Detects `ps4_fan` dynamically through hwmon name lookup
 - Displays current temperature and RPM
 - Writes fan threshold through `temp1_crit`
-- Enforces threshold range `20` to `85` degrees C
+- Enforces threshold range `-10` to `85` degrees C
 - Uses `79` degrees C as reset/default value
 - Debounces slider writes with user-configurable timing
 

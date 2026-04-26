@@ -62,7 +62,7 @@ skm_service_apply_fan(SkmService *self, gint threshold_c)
   }
 
   if (threshold_c < SKM_FAN_THRESHOLD_MIN || threshold_c > SKM_FAN_THRESHOLD_MAX) {
-    return skm_operation_result_new(FALSE, FALSE, "Fan threshold must be 20-85 C.");
+    return skm_operation_result_new(FALSE, FALSE, "Fan threshold must be -10-85 C.");
   }
 
   threshold_path = skm_path_join(self->fan_root, "temp1_crit");
