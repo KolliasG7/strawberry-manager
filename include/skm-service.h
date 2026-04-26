@@ -81,7 +81,7 @@ typedef struct {
 } SkmSnapshot;
 
 enum {
-  SKM_FAN_THRESHOLD_MIN = 20,
+  SKM_FAN_THRESHOLD_MIN = -10,
   SKM_FAN_THRESHOLD_MAX = 85,
   SKM_FAN_THRESHOLD_DEFAULT = 79,
 };
