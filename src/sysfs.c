@@ -87,7 +87,12 @@ skm_sysfs_read_int(const gchar *path, const gchar *label, gint *out_value, GErro
 
   errno = 0;
   parsed = g_ascii_strtoll(text, &endptr, 0);
-  if (errno != 0 || endptr == text) {
+  while (endptr != NULL && g_ascii_isspace(*endptr)) {
+    endptr++;
+  }
+
+  if (errno != 0 || endptr == text || *endptr != '\0' ||
+      parsed < G_MININT || parsed > G_MAXINT) {
     g_set_error(
       error,
       SKM_SYSFS_ERROR,

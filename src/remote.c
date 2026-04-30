@@ -1217,10 +1217,18 @@ skm_write_response(GOutputStream *output,
     reason = "Bad Request";
   } else if (status == 401) {
     reason = "Unauthorized";
+  } else if (status == 403) {
+    reason = "Forbidden";
   } else if (status == 404) {
     reason = "Not Found";
   } else if (status == 405) {
     reason = "Method Not Allowed";
+  } else if (status == 409) {
+    reason = "Conflict";
+  } else if (status == 411) {
+    reason = "Length Required";
+  } else if (status == 413) {
+    reason = "Payload Too Large";
   } else if (status == 422) {
     reason = "Unprocessable Entity";
   } else if (status == 426) {
@@ -2381,12 +2389,14 @@ skm_handle_settings_action(SkmRemoteServer *server, GHashTable *values)
     return skm_operation_result_new(FALSE, FALSE, error->message);
   }
 
-  skm_remote_server_sync_settings(server, &updated, server->settings_path);
-  /* Plaintext has done its job; wipe it from both copies. */
+  /* Plaintext has done its job. Wipe it before syncing so the daemon adopts
+   * the exact salt+hash that was just persisted instead of deriving a second,
+   * in-memory-only hash. */
   if (updated.remote_password != NULL) {
     memset(updated.remote_password, 0, strlen(updated.remote_password));
   }
   g_clear_pointer(&updated.remote_password, g_free);
+  skm_remote_server_sync_settings(server, &updated, server->settings_path);
   g_clear_pointer(&server->settings.remote_password, g_free);
 
   message = g_string_new(created_file ? "settings.ini created." : "settings.ini saved.");
@@ -2465,11 +2475,15 @@ skm_values_from_json_or_form(const gchar *content_type, const gchar *body)
   g_autofree gchar *profile = NULL;
   g_autofree gchar *password = NULL;
   g_autofree gchar *remote_password = NULL;
+  g_autofree gchar *current_password = NULL;
+  g_autofree gchar *new_password = NULL;
   g_autofree gchar *signal_name = NULL;
+  g_autofree gchar *content_type_lower = NULL;
   gint int_value = 0;
   gboolean bool_value = FALSE;
 
-  if (content_type != NULL && g_strrstr(content_type, "application/json") != NULL) {
+  content_type_lower = g_ascii_strdown(content_type != NULL ? content_type : "", -1);
+  if (g_strrstr(content_type_lower, "application/json") != NULL) {
     values = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
     if (skm_json_extract_bool(body, "oled_black_mode", &bool_value)) {
       g_hash_table_replace(values, g_strdup("oled_black_mode"), g_strdup(bool_value ? "1" : "0"));
@@ -2510,6 +2524,14 @@ skm_values_from_json_or_form(const gchar *content_type, const gchar *body)
     remote_password = skm_json_extract_string(body, "remote_password");
     if (remote_password != NULL) {
       g_hash_table_replace(values, g_strdup("remote_password"), g_strdup(remote_password));
+    }
+    current_password = skm_json_extract_string(body, "current_password");
+    if (current_password != NULL) {
+      g_hash_table_replace(values, g_strdup("current_password"), g_strdup(current_password));
+    }
+    new_password = skm_json_extract_string(body, "new_password");
+    if (new_password != NULL) {
+      g_hash_table_replace(values, g_strdup("new_password"), g_strdup(new_password));
     }
     signal_name = skm_json_extract_string(body, "signal");
     if (signal_name != NULL) {
@@ -3199,13 +3221,21 @@ skm_handle_api_request(SkmRemoteServer *server,
     if (g_strcmp0(gpu_act, "manual") == 0 && g_strcmp0(method, "POST") == 0) {
       gboolean enabled = g_strcmp0(g_hash_table_lookup(values, "enabled"), "true") == 0;
       result = skm_service_set_gpu_manual(service, enabled);
-      response = result->success ? g_strdup("{\"ok\":true}")
-                                 : skm_build_json_detail(500, result->message);
+      if (!result->success) {
+        *out_status = result->permission_denied ? 403 : 500;
+        response = skm_build_json_detail(*out_status, result->message);
+      } else {
+        response = g_strdup("{\"ok\":true}");
+      }
     } else if (g_strcmp0(gpu_act, "level") == 0 && g_strcmp0(method, "POST") == 0) {
       gint level = skm_form_get_int(values, "level", 0);
       result = skm_service_apply_gpu_level(service, level);
-      response = result->success ? g_strdup("{\"ok\":true}")
-                                 : skm_build_json_detail(500, result->message);
+      if (!result->success) {
+        *out_status = result->permission_denied ? 403 : 500;
+        response = skm_build_json_detail(*out_status, result->message);
+      } else {
+        response = g_strdup("{\"ok\":true}");
+      }
     } else {
       *out_status = 404;
       response = skm_build_json_detail(404, "GPU route not found.");
