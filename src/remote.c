@@ -39,6 +39,9 @@
 #define SKM_REMOTE_PROCESS_LIMIT_DEFAULT 50
 #define SKM_REMOTE_PROCESS_LIMIT_MAX 200
 #define SKM_REMOTE_OPEN_TOKEN "open-access"
+#define SKM_SESSION_TTL_VIEWER_SEC   (24 * 60 * 60)
+#define SKM_SESSION_TTL_OPERATOR_SEC (12 * 60 * 60)
+#define SKM_SESSION_TTL_ADMIN_SEC    (8 * 60 * 60)
 
 /* Login rate limiting: after this many failures in a row a peer is locked out
  * for SKM_LOGIN_LOCKOUT_SECONDS. Each failed attempt also sleeps briefly to
@@ -87,6 +90,19 @@ typedef struct {
   gint   fail_count;
 } SkmLoginAttempt;
 
+typedef enum {
+  SKM_ROLE_VIEWER = 0,
+  SKM_ROLE_OPERATOR,
+  SKM_ROLE_ADMIN,
+} SkmAuthRole;
+
+typedef struct {
+  SkmAuthRole role;
+  gint64 expires_at_us;
+  gint64 last_seen_us;
+  gchar *peer_ip;
+} SkmAuthSession;
+
 struct _SkmRemoteServer {
   GThreadedSocketService *service;
   gint port;
@@ -101,6 +117,8 @@ struct _SkmRemoteServer {
    * in constant time. The plaintext password is never held in memory after
    * skm_remote_server_set_password() returns. */
   gchar *auth_token;
+  GMutex session_lock;
+  GHashTable *sessions; /* char* token -> SkmAuthSession* */
   GMutex login_lock;
   GHashTable *login_attempts; /* char* peer_ip -> SkmLoginAttempt* */
   gboolean cpu_prev_valid;
@@ -121,6 +139,16 @@ typedef struct {
   gboolean refresh;
   gchar *message;
 } SkmRemoteNotice;
+
+static void
+skm_auth_session_free(SkmAuthSession *session)
+{
+  if (session == NULL) {
+    return;
+  }
+  g_clear_pointer(&session->peer_ip, g_free);
+  g_free(session);
+}
 
 static void
 skm_app_settings_clear(SkmAppSettings *settings)
@@ -213,6 +241,59 @@ skm_token_equal(const gchar *a, const gchar *b)
   return diff == 0;
 }
 
+static const gchar *
+skm_role_to_string(SkmAuthRole role)
+{
+  switch (role) {
+    case SKM_ROLE_VIEWER:
+      return "viewer";
+    case SKM_ROLE_OPERATOR:
+      return "operator";
+    case SKM_ROLE_ADMIN:
+      return "admin";
+    default:
+      return "viewer";
+  }
+}
+
+static SkmAuthRole
+skm_role_from_string(const gchar *text, SkmAuthRole fallback)
+{
+  if (text == NULL || *text == '\0') {
+    return fallback;
+  }
+  if (g_ascii_strcasecmp(text, "admin") == 0) {
+    return SKM_ROLE_ADMIN;
+  }
+  if (g_ascii_strcasecmp(text, "operator") == 0) {
+    return SKM_ROLE_OPERATOR;
+  }
+  if (g_ascii_strcasecmp(text, "viewer") == 0) {
+    return SKM_ROLE_VIEWER;
+  }
+  return fallback;
+}
+
+static gboolean
+skm_role_allows(SkmAuthRole have, SkmAuthRole required)
+{
+  return have >= required;
+}
+
+static gint64
+skm_role_ttl_us(SkmAuthRole role)
+{
+  switch (role) {
+    case SKM_ROLE_ADMIN:
+      return (gint64) SKM_SESSION_TTL_ADMIN_SEC * G_USEC_PER_SEC;
+    case SKM_ROLE_OPERATOR:
+      return (gint64) SKM_SESSION_TTL_OPERATOR_SEC * G_USEC_PER_SEC;
+    case SKM_ROLE_VIEWER:
+    default:
+      return (gint64) SKM_SESSION_TTL_VIEWER_SEC * G_USEC_PER_SEC;
+  }
+}
+
 /* Generate SKM_HMAC_SALT_BYTES random bytes as a lower-case hex string. */
 static gchar *
 skm_generate_hmac_salt(void)
@@ -228,6 +309,136 @@ skm_generate_hmac_salt(void)
     g_string_append_printf(hex, "%02x", raw[i]);
   }
   return g_string_free(hex, FALSE);
+}
+
+static void
+skm_sessions_prune_locked(SkmRemoteServer *server, gint64 now_us)
+{
+  GHashTableIter iter;
+  gpointer key = NULL;
+  gpointer value = NULL;
+
+  g_hash_table_iter_init(&iter, server->sessions);
+  while (g_hash_table_iter_next(&iter, &key, &value)) {
+    SkmAuthSession *session = value;
+    if (session == NULL || session->expires_at_us <= now_us) {
+      g_hash_table_iter_remove(&iter);
+    }
+  }
+}
+
+static gchar *
+skm_sessions_create(SkmRemoteServer *server, SkmAuthRole role, const gchar *peer_ip)
+{
+  g_autofree gchar *token = g_uuid_string_random();
+  SkmAuthSession *session = NULL;
+  gint64 now_us = g_get_monotonic_time();
+
+  if (token == NULL) {
+    return NULL;
+  }
+
+  session = g_new0(SkmAuthSession, 1);
+  session->role = role;
+  session->last_seen_us = now_us;
+  session->expires_at_us = now_us + skm_role_ttl_us(role);
+  session->peer_ip = g_strdup(peer_ip != NULL ? peer_ip : "unknown");
+
+  g_mutex_lock(&server->session_lock);
+  skm_sessions_prune_locked(server, now_us);
+  g_hash_table_replace(server->sessions, g_strdup(token), session);
+  g_mutex_unlock(&server->session_lock);
+  return g_steal_pointer(&token);
+}
+
+static void
+skm_sessions_clear(SkmRemoteServer *server)
+{
+  if (server == NULL) {
+    return;
+  }
+  g_mutex_lock(&server->session_lock);
+  g_hash_table_remove_all(server->sessions);
+  g_mutex_unlock(&server->session_lock);
+}
+
+static gboolean
+skm_sessions_revoke(SkmRemoteServer *server, const gchar *token)
+{
+  gboolean removed = FALSE;
+
+  if (server == NULL || token == NULL || *token == '\0') {
+    return FALSE;
+  }
+  g_mutex_lock(&server->session_lock);
+  removed = g_hash_table_remove(server->sessions, token);
+  g_mutex_unlock(&server->session_lock);
+  return removed;
+}
+
+static gboolean
+skm_session_role_for_token(SkmRemoteServer *server,
+                           const gchar *token,
+                           const gchar *peer_ip,
+                           SkmAuthRole *out_role,
+                           gint64 *out_expires_at_us,
+                           gboolean *out_legacy_token)
+{
+  SkmAuthSession *session = NULL;
+  gint64 now_us = g_get_monotonic_time();
+
+  if (out_role != NULL) {
+    *out_role = SKM_ROLE_VIEWER;
+  }
+  if (out_expires_at_us != NULL) {
+    *out_expires_at_us = 0;
+  }
+  if (out_legacy_token != NULL) {
+    *out_legacy_token = FALSE;
+  }
+
+  if (token == NULL || *token == '\0') {
+    return FALSE;
+  }
+
+  g_mutex_lock(&server->session_lock);
+  skm_sessions_prune_locked(server, now_us);
+  session = g_hash_table_lookup(server->sessions, token);
+  if (session != NULL) {
+    session->last_seen_us = now_us;
+    if (peer_ip != NULL && *peer_ip != '\0') {
+      g_clear_pointer(&session->peer_ip, g_free);
+      session->peer_ip = g_strdup(peer_ip);
+    }
+    if (out_role != NULL) {
+      *out_role = session->role;
+    }
+    if (out_expires_at_us != NULL) {
+      *out_expires_at_us = session->expires_at_us;
+    }
+    g_mutex_unlock(&server->session_lock);
+    return TRUE;
+  }
+  g_mutex_unlock(&server->session_lock);
+
+  if (!server->auth_required && skm_token_equal(token, SKM_REMOTE_OPEN_TOKEN)) {
+    if (out_role != NULL) {
+      *out_role = SKM_ROLE_ADMIN;
+    }
+    return TRUE;
+  }
+
+  /* Backward compatibility: accept the old static hash token as admin. */
+  if (server->auth_required && server->auth_token != NULL && skm_token_equal(token, server->auth_token)) {
+    if (out_role != NULL) {
+      *out_role = SKM_ROLE_ADMIN;
+    }
+    if (out_legacy_token != NULL) {
+      *out_legacy_token = TRUE;
+    }
+    return TRUE;
+  }
+  return FALSE;
 }
 
 /* ── CPU% reader (/proc/stat delta) ────────────────────────────────────── */
@@ -1601,6 +1812,86 @@ skm_build_settings_json(SkmRemoteServer *server)
 }
 
 static gchar *
+skm_build_capabilities_json(SkmSnapshot *snapshot)
+{
+  gboolean fan_rw = snapshot->fan.available && snapshot->fan.has_threshold_c;
+  gboolean led_rw = snapshot->led.available;
+  gboolean gpu_rw = snapshot->gpu.available && snapshot->gpu.supported_hardware;
+  gboolean hdmi_rw = snapshot->hdmi.available;
+  gboolean files = TRUE;
+  gboolean processes = TRUE;
+  gboolean power = TRUE;
+
+  return g_strdup_printf(
+    "{"
+    "\"fan\":{\"available\":%s,\"write\":%s},"
+    "\"led\":{\"available\":%s,\"write\":%s,\"thermal_mode\":%s},"
+    "\"gpu\":{\"available\":%s,\"write\":%s,\"supported_hardware\":%s},"
+    "\"hdmi\":{\"available\":%s,\"write\":%s},"
+    "\"system\":{\"processes\":%s,\"power\":%s},"
+    "\"files\":{\"available\":%s}"
+    "}",
+    snapshot->fan.available ? "true" : "false",
+    fan_rw ? "true" : "false",
+    snapshot->led.available ? "true" : "false",
+    led_rw ? "true" : "false",
+    snapshot->led.thermal_mode_supported ? "true" : "false",
+    snapshot->gpu.available ? "true" : "false",
+    gpu_rw ? "true" : "false",
+    snapshot->gpu.supported_hardware ? "true" : "false",
+    snapshot->hdmi.available ? "true" : "false",
+    hdmi_rw ? "true" : "false",
+    processes ? "true" : "false",
+    power ? "true" : "false",
+    files ? "true" : "false");
+}
+
+static gchar *
+skm_build_diagnostics_json(SkmRemoteServer *server, SkmSnapshot *snapshot, const gchar *peer_ip)
+{
+  g_autofree gchar *fan_msg = skm_json_escape(snapshot->fan.message != NULL ? snapshot->fan.message : "");
+  g_autofree gchar *led_msg = skm_json_escape(snapshot->led.message != NULL ? snapshot->led.message : "");
+  g_autofree gchar *gpu_msg = skm_json_escape(snapshot->gpu.message != NULL ? snapshot->gpu.message : "");
+  g_autofree gchar *hdmi_msg = skm_json_escape(snapshot->hdmi.message != NULL ? snapshot->hdmi.message : "");
+  g_autofree gchar *gpu_warn = skm_json_escape(snapshot->gpu.warning != NULL ? snapshot->gpu.warning : "");
+  g_autofree gchar *peer = skm_json_escape(peer_ip != NULL ? peer_ip : "unknown");
+  g_autofree gchar *kernel = skm_json_escape(snapshot->system.kernel_version != NULL ? snapshot->system.kernel_version : "Unavailable");
+  g_autofree gchar *variant = skm_json_escape(snapshot->system.hardware_variant != NULL ? snapshot->system.hardware_variant : "Unknown");
+
+  return g_strdup_printf(
+    "{"
+    "\"status\":\"ok\","
+    "\"peer_ip\":\"%s\","
+    "\"auth_required\":%s,"
+    "\"remote_enabled\":%s,"
+    "\"remote_port\":%d,"
+    "\"kernel\":\"%s\","
+    "\"hardware_variant\":\"%s\","
+    "\"fan\":{\"available\":%s,\"message\":\"%s\"},"
+    "\"led\":{\"available\":%s,\"message\":\"%s\",\"thermal_mode_supported\":%s},"
+    "\"gpu\":{\"available\":%s,\"message\":\"%s\",\"warning\":\"%s\",\"supported_hardware\":%s},"
+    "\"hdmi\":{\"available\":%s,\"message\":\"%s\"}"
+    "}",
+    peer,
+    server->auth_required ? "true" : "false",
+    server->settings.remote_enabled ? "true" : "false",
+    server->settings.remote_port,
+    kernel,
+    variant,
+    snapshot->fan.available ? "true" : "false",
+    fan_msg,
+    snapshot->led.available ? "true" : "false",
+    led_msg,
+    snapshot->led.thermal_mode_supported ? "true" : "false",
+    snapshot->gpu.available ? "true" : "false",
+    gpu_msg,
+    gpu_warn,
+    snapshot->gpu.supported_hardware ? "true" : "false",
+    snapshot->hdmi.available ? "true" : "false",
+    hdmi_msg);
+}
+
+static gchar *
 skm_build_led_profiles_json(const SkmLedState *state)
 {
   GString *json = g_string_new("{\"profiles\":[");
@@ -1939,18 +2230,73 @@ skm_files_validate_upload_target(const gchar *input, const gchar **out_reason)
 /* Shared auth check mirroring the inline block at the top of
  * skm_handle_api_request — lets the file streaming pre-dispatch do the
  * same check without routing through the buffered-body code path. */
-static gboolean
-skm_remote_auth_check(SkmRemoteServer *server, GHashTable *headers)
+static const gchar *
+skm_auth_bearer_from_headers(GHashTable *headers)
 {
-  if (!server->auth_required) return TRUE;
-  if (headers == NULL) return FALSE;
-  const gchar *auth_header = g_hash_table_lookup(headers, "authorization");
-  const gchar *bearer = NULL;
-  if (auth_header != NULL && g_str_has_prefix(auth_header, "Bearer "))
-    bearer = auth_header + 7;
-  else
-    bearer = g_hash_table_lookup(headers, "token");
-  return bearer != NULL && skm_token_equal(bearer, server->auth_token);
+  const gchar *auth_header = NULL;
+
+  if (headers == NULL) {
+    return NULL;
+  }
+
+  auth_header = g_hash_table_lookup(headers, "authorization");
+  if (auth_header != NULL && g_str_has_prefix(auth_header, "Bearer ")) {
+    return auth_header + 7;
+  }
+  return g_hash_table_lookup(headers, "token");
+}
+
+static SkmAuthRole
+skm_required_role_for_route(const gchar *method, const gchar *path)
+{
+  if (path == NULL) {
+    return SKM_ROLE_VIEWER;
+  }
+
+  if (g_strcmp0(path, "/auth/change-password") == 0 ||
+      (g_strcmp0(path, "/api/settings") == 0 && g_strcmp0(method, "POST") == 0) ||
+      g_strcmp0(path, "/api/system/process/kill") == 0 ||
+      g_str_has_prefix(path, "/api/power/") ||
+      g_strcmp0(path, "/api/files/delete") == 0) {
+    return SKM_ROLE_ADMIN;
+  }
+
+  if (g_strcmp0(path, "/api/fan/threshold") == 0 ||
+      g_strcmp0(path, "/api/led") == 0 ||
+      g_str_has_prefix(path, "/api/gpu/") ||
+      g_strcmp0(path, "/api/files/upload") == 0) {
+    if (g_strcmp0(method, "POST") == 0 || g_strcmp0(method, "DELETE") == 0) {
+      return SKM_ROLE_OPERATOR;
+    }
+  }
+
+  return SKM_ROLE_VIEWER;
+}
+
+static gboolean
+skm_remote_auth_check(SkmRemoteServer *server,
+                      GHashTable *headers,
+                      const gchar *peer_ip,
+                      SkmAuthRole required_role,
+                      SkmAuthRole *out_role)
+{
+  const gchar *bearer = skm_auth_bearer_from_headers(headers);
+  SkmAuthRole role = SKM_ROLE_VIEWER;
+
+  if (!server->auth_required) {
+    if (out_role != NULL) {
+      *out_role = SKM_ROLE_ADMIN;
+    }
+    return TRUE;
+  }
+
+  if (!skm_session_role_for_token(server, bearer, peer_ip, &role, NULL, NULL)) {
+    return FALSE;
+  }
+  if (out_role != NULL) {
+    *out_role = role;
+  }
+  return skm_role_allows(role, required_role);
 }
 
 /* Streams a file's contents to @output as a 200 response. Avoids loading
@@ -2398,6 +2744,9 @@ skm_handle_settings_action(SkmRemoteServer *server, GHashTable *values)
   g_clear_pointer(&updated.remote_password, g_free);
   skm_remote_server_sync_settings(server, &updated, server->settings_path);
   g_clear_pointer(&server->settings.remote_password, g_free);
+  if (password_changed) {
+    skm_sessions_clear(server);
+  }
 
   message = g_string_new(created_file ? "settings.ini created." : "settings.ini saved.");
   if (password_changed) {
@@ -2473,6 +2822,7 @@ skm_values_from_json_or_form(const gchar *content_type, const gchar *body)
 {
   GHashTable *values = NULL;
   g_autofree gchar *profile = NULL;
+  g_autofree gchar *role = NULL;
   g_autofree gchar *password = NULL;
   g_autofree gchar *remote_password = NULL;
   g_autofree gchar *current_password = NULL;
@@ -2520,6 +2870,10 @@ skm_values_from_json_or_form(const gchar *content_type, const gchar *body)
     password = skm_json_extract_string(body, "password");
     if (password != NULL) {
       g_hash_table_replace(values, g_strdup("password"), g_strdup(password));
+    }
+    role = skm_json_extract_string(body, "role");
+    if (role != NULL) {
+      g_hash_table_replace(values, g_strdup("role"), g_strdup(role));
     }
     remote_password = skm_json_extract_string(body, "remote_password");
     if (remote_password != NULL) {
@@ -2810,6 +3164,9 @@ skm_handle_api_request(SkmRemoteServer *server,
   SkmSnapshot *snapshot = NULL;
   SkmService *service = NULL;
   SkmOperationResult *result = NULL;
+  SkmAuthRole auth_role = SKM_ROLE_ADMIN;
+  gint64 auth_expires_at_us = 0;
+  gboolean using_legacy_token = FALSE;
   gchar *response = NULL;
   const gchar *action = NULL;
 
@@ -2818,9 +3175,11 @@ skm_handle_api_request(SkmRemoteServer *server,
 
   /* ── /auth/login ────────────────────────────────────────────────────── */
   if (g_strcmp0(path, "/auth/login") == 0 && g_strcmp0(method, "POST") == 0) {
+    const gchar *requested_role_text = g_hash_table_lookup(values, "role");
+    SkmAuthRole requested_role = skm_role_from_string(requested_role_text, SKM_ROLE_ADMIN);
     if (!server->auth_required) {
       /* No password configured — return stable token for reconnects. */
-      return g_strdup_printf("{\"token\":\"%s\",\"auth_required\":false}",
+      return g_strdup_printf("{\"token\":\"%s\",\"auth_required\":false,\"role\":\"admin\"}",
                              SKM_REMOTE_OPEN_TOKEN);
     }
     if (skm_login_is_locked(server, peer_ip)) {
@@ -2842,34 +3201,58 @@ skm_handle_api_request(SkmRemoteServer *server,
       return skm_build_json_detail(401, "Wrong password.");
     }
     skm_login_record_success(server, peer_ip);
-    return g_strdup_printf("{\"token\":\"%s\",\"auth_required\":true}",
-                           server->auth_token);
+    g_autofree gchar *session_token = skm_sessions_create(server, requested_role, peer_ip);
+    if (session_token == NULL) {
+      *out_status = 500;
+      return skm_build_json_detail(500, "Failed creating auth session.");
+    }
+    return g_strdup_printf(
+      "{\"token\":\"%s\",\"auth_required\":true,\"role\":\"%s\",\"expires_in_s\":%" G_GINT64_FORMAT "}",
+      session_token,
+      skm_role_to_string(requested_role),
+      skm_role_ttl_us(requested_role) / G_USEC_PER_SEC);
   }
 
   /* ── /auth/verify ────────────────────────────────────────────────────── */
   if (g_strcmp0(path, "/auth/verify") == 0 && g_strcmp0(method, "GET") == 0) {
-    /* auth guard below will reject if token bad; if we reach here it's valid */
-    return g_strdup_printf("{\"ok\":true,\"auth_required\":%s}",
-                           server->auth_required ? "true" : "false");
+    const gchar *bearer = skm_auth_bearer_from_headers(headers);
+    if (server->auth_required &&
+        !skm_session_role_for_token(server, bearer, peer_ip, &auth_role, &auth_expires_at_us, &using_legacy_token)) {
+      *out_status = 401;
+      return skm_build_json_detail(401, "Invalid or missing token.");
+    }
+    return g_strdup_printf(
+      "{\"ok\":true,\"auth_required\":%s,\"role\":\"%s\",\"legacy_token\":%s,\"expires_at_unix_ms\":%" G_GINT64_FORMAT "}",
+      server->auth_required ? "true" : "false",
+      skm_role_to_string(server->auth_required ? auth_role : SKM_ROLE_ADMIN),
+      using_legacy_token ? "true" : "false",
+      auth_expires_at_us > 0 ? auth_expires_at_us / 1000 : 0);
   }
 
   /* ── Auth guard (all routes below require valid token if password set) ── */
   if (server->auth_required) {
-    const gchar *auth_header = NULL;
-    const gchar *bearer = NULL;
+    const gchar *bearer = skm_auth_bearer_from_headers(headers);
+    SkmAuthRole required_role = skm_required_role_for_route(method, path);
 
-    if (headers != NULL)
-      auth_header = g_hash_table_lookup(headers, "authorization");
-
-    if (auth_header != NULL && g_str_has_prefix(auth_header, "Bearer "))
-      bearer = auth_header + 7;
-    else if (headers != NULL)
-      bearer = g_hash_table_lookup(headers, "token"); /* WS query param fallback */
-
-    if (bearer == NULL || !skm_token_equal(bearer, server->auth_token)) {
+    if (!skm_session_role_for_token(server, bearer, peer_ip, &auth_role, &auth_expires_at_us, &using_legacy_token)) {
       *out_status = 401;
       return skm_build_json_detail(401, "Invalid or missing token.");
     }
+    if (!skm_role_allows(auth_role, required_role)) {
+      *out_status = 403;
+      return skm_build_json_detail(403, "Token role is not allowed to access this route.");
+    }
+  } else {
+    auth_role = SKM_ROLE_ADMIN;
+  }
+
+  if (g_strcmp0(path, "/auth/logout") == 0 && g_strcmp0(method, "POST") == 0) {
+    const gchar *bearer = skm_auth_bearer_from_headers(headers);
+    if (server->auth_required && (bearer == NULL || !skm_sessions_revoke(server, bearer))) {
+      *out_status = 401;
+      return skm_build_json_detail(401, "Invalid or expired session token.");
+    }
+    return g_strdup("{\"ok\":true}");
   }
 
   /* ── /auth/change-password ───────────────────────────────────────────── */
@@ -2973,6 +3356,7 @@ skm_handle_api_request(SkmRemoteServer *server,
     server->settings.remote_password_hash = g_strdup(new_hash);
     server->auth_token   = g_strdup(new_hash);
     server->auth_required = TRUE;
+    skm_sessions_clear(server);
     skm_app_settings_clear(&updated);
 
     return g_strdup_printf("{\"ok\":true,\"token\":\"%s\",\"auth_required\":true}",
@@ -2996,6 +3380,24 @@ skm_handle_api_request(SkmRemoteServer *server,
       skm_operation_result_free(result);
       return response;
     }
+  }
+
+  if (g_strcmp0(path, "/api/capabilities") == 0 && g_strcmp0(method, "GET") == 0) {
+    service = skm_service_new("/sys", "/proc");
+    snapshot = skm_service_read_snapshot(service);
+    response = skm_build_capabilities_json(snapshot);
+    skm_snapshot_free(snapshot);
+    skm_service_free(service);
+    return response;
+  }
+
+  if (g_strcmp0(path, "/api/diagnostics") == 0 && g_strcmp0(method, "GET") == 0) {
+    service = skm_service_new("/sys", "/proc");
+    snapshot = skm_service_read_snapshot(service);
+    response = skm_build_diagnostics_json(server, snapshot, peer_ip);
+    skm_snapshot_free(snapshot);
+    skm_service_free(service);
+    return response;
   }
 
   service  = skm_service_new("/sys", "/proc");
@@ -3340,6 +3742,8 @@ skm_remote_server_run(GThreadedSocketService *service,
   }
   skm_normalize_path(path);
   query = skm_parse_form(query_text);
+  peer = skm_remote_identify_peer(connection);
+  peer_ip = skm_remote_peer_ip(peer);
 
   /* ── File upload / download pre-dispatch ─────────────────────────────────
    * These two endpoints need streaming I/O: the 64 KB body ceiling and the
@@ -3348,7 +3752,7 @@ skm_remote_server_run(GThreadedSocketService *service,
    * enforced on normal requests, and bypass skm_write_response() so we can
    * stream chunks straight to the socket. */
   if (g_strcmp0(path, "/api/files/download") == 0 && g_strcmp0(method, "GET") == 0) {
-    if (!skm_remote_auth_check(server, headers)) {
+    if (!skm_remote_auth_check(server, headers, peer_ip, SKM_ROLE_VIEWER, NULL)) {
       skm_write_response(output, 401, "application/json; charset=utf-8",
                          skm_build_json_detail(401, "Invalid or missing token."));
       g_io_stream_close(G_IO_STREAM(connection), NULL, NULL);
@@ -3373,9 +3777,19 @@ skm_remote_server_run(GThreadedSocketService *service,
      * SCP / the PS4's usual transfer path; the daemon's job is convenience,
      * not bulk-data serving. */
     const gsize upload_max = (gsize) 128 * 1024 * 1024;
-    if (!skm_remote_auth_check(server, headers)) {
+    const gchar *bearer = skm_auth_bearer_from_headers(headers);
+    SkmAuthRole file_role = SKM_ROLE_VIEWER;
+    if (!server->auth_required) {
+      file_role = SKM_ROLE_ADMIN;
+    } else if (!skm_session_role_for_token(server, bearer, peer_ip, &file_role, NULL, NULL)) {
       skm_write_response(output, 401, "application/json; charset=utf-8",
                          skm_build_json_detail(401, "Invalid or missing token."));
+      g_io_stream_close(G_IO_STREAM(connection), NULL, NULL);
+      return TRUE;
+    }
+    if (!skm_role_allows(file_role, SKM_ROLE_OPERATOR)) {
+      skm_write_response(output, 403, "application/json; charset=utf-8",
+                         skm_build_json_detail(403, "Token role is not allowed to upload files."));
       g_io_stream_close(G_IO_STREAM(connection), NULL, NULL);
       return TRUE;
     }
@@ -3427,7 +3841,6 @@ skm_remote_server_run(GThreadedSocketService *service,
      * already prefetched while parsing headers. */
     body = skm_read_body(G_INPUT_STREAM(data_input), content_length);
   }
-  peer = skm_remote_identify_peer(connection);
   skm_remote_record_client(server, peer, method, path, g_hash_table_lookup(headers, "user-agent"));
 
   if (skm_is_websocket_request(headers)) {
@@ -3455,14 +3868,25 @@ skm_remote_server_run(GThreadedSocketService *service,
      * legacy clients. */
     if (server->auth_required) {
       const gchar *bearer = NULL;
+      SkmAuthRole ws_role = SKM_ROLE_VIEWER;
+      SkmAuthRole ws_required_role = SKM_ROLE_VIEWER;
       if (has_bearer) {
         bearer = auth_hdr + 7;
       } else if (qs_token != NULL) {
         bearer = qs_token;
       }
-      if (bearer == NULL || !skm_token_equal(bearer, server->auth_token)) {
+      if (g_strcmp0(path, "/ws/terminal") == 0) {
+        ws_required_role = SKM_ROLE_OPERATOR;
+      }
+      if (!skm_session_role_for_token(server, bearer, peer_ip, &ws_role, NULL, NULL)) {
         skm_write_response(output, 401, "application/json; charset=utf-8",
                            skm_build_json_detail(401, "Unauthorized"));
+        g_io_stream_close(G_IO_STREAM(connection), NULL, NULL);
+        return TRUE;
+      }
+      if (!skm_role_allows(ws_role, ws_required_role)) {
+        skm_write_response(output, 403, "application/json; charset=utf-8",
+                           skm_build_json_detail(403, "Token role is not allowed for this WebSocket route."));
         g_io_stream_close(G_IO_STREAM(connection), NULL, NULL);
         return TRUE;
       }
@@ -3501,7 +3925,6 @@ skm_remote_server_run(GThreadedSocketService *service,
    * attribute fired on an uninitialized stack slot, which showed up as
    * `free(): invalid size` on -O2 release builds (ASan's -O0 zero-init
    * happened to mask it). */
-  peer_ip = skm_remote_peer_ip(peer);
   response_body = skm_handle_api_request(
     server,
     method,
@@ -3558,7 +3981,10 @@ skm_remote_server_new(SkmRemoteNoticeFunc notice_cb, gpointer user_data)
   server->notice_user_data = user_data;
   server->recent_clients = g_ptr_array_new_with_free_func(g_free);
   g_mutex_init(&server->lock);
+  g_mutex_init(&server->session_lock);
   g_mutex_init(&server->login_lock);
+  server->sessions = g_hash_table_new_full(
+    g_str_hash, g_str_equal, g_free, (GDestroyNotify) skm_auth_session_free);
   server->login_attempts = g_hash_table_new_full(
     g_str_hash, g_str_equal, g_free, g_free);
 
@@ -3604,6 +4030,7 @@ skm_remote_server_set_password(SkmRemoteServer *server, const gchar *password)
   g_return_if_fail(server != NULL);
 
   g_clear_pointer(&server->auth_token, g_free);
+  skm_sessions_clear(server);
 
   if (password != NULL && *password != '\0') {
     /* Generate a fresh salt on each rotation so old leaked hashes can't be
@@ -3632,6 +4059,7 @@ skm_remote_server_sync_settings(SkmRemoteServer *server,
 
   g_return_if_fail(server != NULL);
   g_return_if_fail(settings != NULL);
+  skm_sessions_clear(server);
 
   path_copy = settings_path != NULL ? g_strdup(settings_path) : NULL;
   skm_app_settings_assign(&server->settings, settings);
@@ -3673,7 +4101,9 @@ skm_remote_server_free(SkmRemoteServer *server)
 
   skm_remote_server_stop(server);
   g_mutex_clear(&server->lock);
+  g_mutex_clear(&server->session_lock);
   g_mutex_clear(&server->login_lock);
+  g_clear_pointer(&server->sessions, g_hash_table_unref);
   g_clear_pointer(&server->login_attempts, g_hash_table_unref);
   g_clear_pointer(&server->recent_clients, g_ptr_array_unref);
   g_clear_pointer(&server->last_client,    g_free);
