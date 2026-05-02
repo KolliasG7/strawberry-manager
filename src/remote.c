@@ -2227,6 +2227,46 @@ skm_files_validate_upload_target(const gchar *input, const gchar **out_reason)
   return g_build_filename(canon_parent, base, NULL);
 }
 
+/* Recursively delete a directory tree. Returns 0 on success, -1 on
+ * failure (errno set by the first failing syscall). On partial failure
+ * some children may already be removed. */
+static int
+skm_recursive_rmdir(const gchar *path)
+{
+  GDir *dir = NULL;
+  const gchar *name = NULL;
+
+  dir = g_dir_open(path, 0, NULL);
+  if (dir == NULL) {
+    return -1;
+  }
+
+  while ((name = g_dir_read_name(dir)) != NULL) {
+    g_autofree gchar *child = g_build_filename(path, name, NULL);
+    GStatBuf st;
+
+    if (g_stat(child, &st) != 0) {
+      g_dir_close(dir);
+      return -1;
+    }
+
+    if (S_ISDIR(st.st_mode)) {
+      if (skm_recursive_rmdir(child) != 0) {
+        g_dir_close(dir);
+        return -1;
+      }
+    } else {
+      if (g_unlink(child) != 0) {
+        g_dir_close(dir);
+        return -1;
+      }
+    }
+  }
+
+  g_dir_close(dir);
+  return g_rmdir(path);
+}
+
 /* Shared auth check mirroring the inline block at the top of
  * skm_handle_api_request — lets the file streaming pre-dispatch do the
  * same check without routing through the buffered-body code path. */
@@ -3597,14 +3637,12 @@ skm_handle_api_request(SkmRemoteServer *server,
           *out_status = 409;
           response = skm_build_json_detail(409,
             "Target is a directory; pass ?recursive=1 to confirm.");
-        } else if (g_rmdir(safe_path) == 0) {
-          /* Escape safe_path — Linux filenames can contain " and \, which
-           * would produce malformed JSON without this pass. */
+        } else if (skm_recursive_rmdir(safe_path) == 0) {
           g_autofree gchar *escaped = skm_json_escape(safe_path);
           response = g_strdup_printf(
             "{\"ok\":true,\"path\":\"%s\",\"kind\":\"dir\"}", escaped);
         } else {
-          *out_status = errno == ENOTEMPTY ? 409 : 500;
+          *out_status = 500;
           response = skm_build_json_detail(*out_status, g_strerror(errno));
         }
       } else if (g_unlink(safe_path) == 0) {
@@ -3706,6 +3744,13 @@ skm_remote_server_run(GThreadedSocketService *service,
 
   (void) service;
   (void) source_object;
+
+  {
+    GSocket *sock = g_socket_connection_get_socket(connection);
+    if (sock != NULL) {
+      g_socket_set_timeout(sock, 30);
+    }
+  }
 
   input = g_io_stream_get_input_stream(G_IO_STREAM(connection));
   output = g_io_stream_get_output_stream(G_IO_STREAM(connection));
@@ -4056,12 +4101,20 @@ skm_remote_server_sync_settings(SkmRemoteServer *server,
                                 const gchar *settings_path)
 {
   g_autofree gchar *path_copy = NULL;
+  gboolean password_changed = FALSE;
 
   g_return_if_fail(server != NULL);
   g_return_if_fail(settings != NULL);
-  skm_sessions_clear(server);
 
   path_copy = settings_path != NULL ? g_strdup(settings_path) : NULL;
+
+  password_changed =
+    (settings->remote_password != NULL && *settings->remote_password != '\0') ||
+    (server->settings.remote_password_hash != NULL && settings->remote_password_hash == NULL) ||
+    (server->settings.remote_password_hash == NULL && settings->remote_password_hash != NULL) ||
+    (server->settings.remote_password_hash != NULL && settings->remote_password_hash != NULL &&
+     g_strcmp0(server->settings.remote_password_hash, settings->remote_password_hash) != 0);
+
   skm_app_settings_assign(&server->settings, settings);
   if (path_copy != NULL) {
     g_clear_pointer(&server->settings_path, g_free);
@@ -4079,6 +4132,7 @@ skm_remote_server_sync_settings(SkmRemoteServer *server,
     g_clear_pointer(&server->settings.remote_password, g_free);
     skm_remote_server_set_password(server, plaintext);
     memset(plaintext, 0, strlen(plaintext));
+    password_changed = TRUE;
   } else {
     g_clear_pointer(&server->auth_token, g_free);
     if (server->settings.remote_password_hash != NULL &&
@@ -4089,6 +4143,10 @@ skm_remote_server_sync_settings(SkmRemoteServer *server,
       server->auth_required = FALSE;
     }
     g_clear_pointer(&server->settings.remote_password, g_free);
+  }
+
+  if (password_changed) {
+    skm_sessions_clear(server);
   }
 }
 
